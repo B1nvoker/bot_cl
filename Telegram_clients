@@ -1,49 +1,30 @@
-// ✅ ТОКЕН (ОБЯЗАТЕЛЬНО ЗАМЕНИТЕ ПОСЛЕ /revoke)
+// ✅ ТОКЕН
 var TOKEN_CLIENTS = "8738738289:AAE2O-xRBq9uyejNdm4f-GE_WRmztDZ-H88";
 var TELEGRAM_URL = "https://api.telegram.org/bot" + TOKEN_CLIENTS;
-
-// ✅ ID ТАБЛИЦЫ
 var SPREADSHEET_ID = "13-2uFUBPUBSgDisDutP-rBjxEzI04ZfOz1njYvlVf7A";
 
-// ⚡ КЭШ таблицы (для скорости)
-var CACHED_SHEET = null;
-function getSheet() {
-  if (!CACHED_SHEET) {
-    CACHED_SHEET = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName("Доп Гарантия");
-  }
-  return CACHED_SHEET;
-}
-
-// 📦 Работа с состоянием
-function setUserState(chatId, state, data) {
+// 📦 Функции с TTL (как в вашем примере)
+function setWithTTL(key, value, ttlSeconds) {
   var props = PropertiesService.getScriptProperties();
-  props.setProperty("state_" + chatId, JSON.stringify({ state: state, data: data || {} }));
+  props.setProperty(key, JSON.stringify({
+    value: value,
+    expires: Date.now() + (ttlSeconds * 1000)
+  }));
 }
 
-function getUserState(chatId) {
+function getWithTTL(key) {
   var props = PropertiesService.getScriptProperties();
-  var raw = props.getProperty("state_" + chatId);
-  return raw ? JSON.parse(raw) : null;
-}
-
-function clearUserState(chatId) {
-  PropertiesService.getScriptProperties().deleteProperty("state_" + chatId);
-}
-
-// ✅ Ответ на callback
-function answerCallback(callbackQueryId) {
+  var raw = props.getProperty(key);
+  if (!raw) return null;
   try {
-    UrlFetchApp.fetch(TELEGRAM_URL + "/answerCallbackQuery", {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify({
-        callback_query_id: callbackQueryId,
-        text: "🔄 Обрабатываем...",
-        show_alert: false
-      })
-    });
+    var data = JSON.parse(raw);
+    if (data.expires && Date.now() > data.expires) {
+      props.deleteProperty(key);
+      return null;
+    }
+    return data.value;
   } catch(e) {
-    Logger.log("Ошибка answerCallback: " + e);
+    return null;
   }
 }
 
@@ -53,334 +34,236 @@ function sendMessage(chatId, text) {
     UrlFetchApp.fetch(TELEGRAM_URL + "/sendMessage", {
       method: "post",
       contentType: "application/json",
-      payload: JSON.stringify({
-        chat_id: chatId,
-        text: text
-      })
+      muteHttpExceptions: true,
+      payload: JSON.stringify({ chat_id: chatId, text: text })
     });
-  } catch(e) {
-    Logger.log("Ошибка sendMessage: " + e);
-  }
+  } catch(e) {}
 }
 
 // 🔘 Стартовая кнопка
 function sendInlineButton(chatId) {
-  var payload = {
-    chat_id: chatId,
-    text: "🔧 Выберите действие:",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "✅ Подтвердить серв. обслуживание", callback_data: "confirm_service" }]
-      ]
-    }
-  };
-
   UrlFetchApp.fetch(TELEGRAM_URL + "/sendMessage", {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify(payload)
+    muteHttpExceptions: true,
+    payload: JSON.stringify({
+      chat_id: chatId,
+      text: "🔧 Выберите действие:",
+      reply_markup: { inline_keyboard: [[{ text: "✅ Подтвердить серв. обслуживание", callback_data: "confirm_service" }]] }
+    })
   });
 }
 
 // ✅ Нормализация
-function normalize(str) {
-  return String(str).toLowerCase().replace(/\s+/g, "");
-}
-
-function normalizeSerial(str) {
-  return String(str).toUpperCase().replace(/\s+/g, "");
-}
-
-function normalizeDate(value, timezone) {
-  if (value instanceof Date) {
-    return Utilities.formatDate(value, timezone, "yyyy-MM-dd");
-  }
-
-  var str = String(value);
-
-  var match = str.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
-  if (match) {
-    return match[3] + "-" + match[2] + "-" + match[1];
-  }
-
-  match = str.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (match) {
-    return match[3] + "-" + match[2] + "-" + match[1];
-  }
-
-  match = str.match(/^(\d{2})-(\d{2})-(\d{4})$/);
-  if (match) {
-    return match[3] + "-" + match[2] + "-" + match[1];
-  }
-
-  var parsed = new Date(str);
-  if (!isNaN(parsed)) {
-    return Utilities.formatDate(parsed, timezone, "yyyy-MM-dd");
-  }
-
-  return str;
-}
-
-function isValidDate(dateStr) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
-}
-
-function isEmptySerial(value) {
-  return !String(value).trim();
-}
+function normalize(str) { return String(str).toLowerCase().replace(/\s+/g, ""); }
+function normalizeSerial(str) { return String(str).toUpperCase().replace(/\s+/g, ""); }
+function parsePrice(str) { return parseFloat(str.replace(',', '.')); }
 
 // 📅 Кнопки с датами
 function sendDateButtons(chatId) {
-  var today = new Date();
   var buttons = [];
   var timezone = Session.getScriptTimeZone();
-
+  var today = new Date();
+  
   for (var i = 0; i < 7; i++) {
     var d = new Date();
     d.setDate(today.getDate() - i);
     var formatted = Utilities.formatDate(d, timezone, "yyyy-MM-dd");
-    buttons.push([{
-      text: formatted,
-      callback_data: "date_" + formatted
-    }]);
+    buttons.push([{ text: formatted, callback_data: "date_" + formatted }]);
   }
-
-  buttons.push([{
-    text: "✏️ Ввести вручную",
-    callback_data: "manual_date"
-  }]);
-
-  var payload = {
-    chat_id: chatId,
-    text: "📅 Пожалуйста, выберите дату покупки из списка или введите вручную 👇",
-    reply_markup: {
-      inline_keyboard: buttons
-    }
-  };
-
+  buttons.push([{ text: "✏️ Ввести вручную", callback_data: "manual_date" }]);
+  
+  sendMessage(chatId, "📅 Выберите дату покупки:");
+  // Отправляем кнопки отдельным сообщением
   UrlFetchApp.fetch(TELEGRAM_URL + "/sendMessage", {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify(payload)
+    muteHttpExceptions: true,
+    payload: JSON.stringify({
+      chat_id: chatId,
+      text: "👇 Нажмите на дату:",
+      reply_markup: { inline_keyboard: buttons }
+    })
   });
 }
 
-// 🔎 Проверка гарантии
-function checkWarranty(chatId, user) {
+// 🔎 Проверка гарантии (быстрая)
+function checkWarranty(chatId, date, model, serial, userName) {
   var lock = LockService.getScriptLock();
-  var lockAcquired = false;
+  if (!lock.tryLock(2000)) {
+    sendMessage(chatId, "⏳ Система занята, попробуйте ещё раз");
+    return;
+  }
   
   try {
-    if (!lock.tryLock(3000)) {
-      sendMessage(chatId, "⏳ Система занята, попробуйте ещё раз через пару секунд");
-      return;
-    }
-    lockAcquired = true;
-    
-    var sheet = getSheet(); // ⚡ используем кэш
-    
+    var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName("Доп Гарантия");
     if (!sheet) {
-      sendMessage(chatId, "⚠️ Ошибка: лист 'Доп Гарантия' не найден");
-      clearUserState(chatId);
-      sendInlineButton(chatId);
-      return;
-    }
-
-    var lastRow = sheet.getLastRow();
-    if (lastRow <= 1) {
-      sendMessage(chatId, "❌ Данные не найдены. Таблица пуста.");
-      clearUserState(chatId);
+      sendMessage(chatId, "⚠️ Ошибка: лист не найден");
       sendInlineButton(chatId);
       return;
     }
     
+    var lastRow = sheet.getLastRow();
     var data = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
     var foundRow = -1;
     var timezone = Session.getScriptTimeZone();
-
+    
     for (var i = 0; i < data.length; i++) {
-      var rawDate = data[i][0];
-      var date = normalizeDate(rawDate, timezone);
-
-      var model = data[i][1];
-      var serialExists = data[i][2];
-
-      if (date === user.date && 
-          normalize(model) === normalize(user.model) && 
-          isEmptySerial(serialExists)) {
+      var rowDate = data[i][0] instanceof Date ? 
+        Utilities.formatDate(data[i][0], timezone, "yyyy-MM-dd") : 
+        String(data[i][0]).split('.').reverse().join('-');
+      
+      if (rowDate === date && 
+          normalize(data[i][1]) === normalize(model) && 
+          !String(data[i][2]).trim()) {
         foundRow = i;
         break;
       }
     }
-
+    
     if (foundRow !== -1) {
       var row = foundRow + 2;
-
-      var isConfirmed = sheet.getRange(row, 4).getValue();
-
-      if (isConfirmed === true) {
-        sendMessage(chatId, "⚠️ Гарантия уже была подтверждена ранее для этого устройства.");
-        clearUserState(chatId);
-        sendInlineButton(chatId);
-        return;
+      if (sheet.getRange(row, 4).getValue() === true) {
+        sendMessage(chatId, "⚠️ Гарантия уже подтверждена");
+      } else {
+        sheet.getRange(row, 3, 1, 2).setValues([[normalizeSerial(serial), true]]);
+        sendMessage(chatId, "✅ Гарантия подтверждена!\nСпасибо!");
       }
-
-      var normalizedSerial = normalizeSerial(user.serial);
-      sheet.getRange(row, 3, 1, 2).setValues([[normalizedSerial, true]]);
-
-      sendMessage(chatId, "✅ Ваша дополнительная гарантия подтверждена!\n\nСпасибо за обращение!");
-      
-      sendInlineButton(chatId);
     } else {
-      sendMessage(chatId, "❌ Данные не найдены.\n\nПроверьте:\n• Дату покупки\n• Модель устройства\n\nЕсли данные верны, обратитесь в поддержку.");
-      
-      sendInlineButton(chatId);
+      sendMessage(chatId, "❌ Данные не найдены.\nПроверьте дату и модель");
     }
-
-    clearUserState(chatId);
-  } catch (error) {
-    Logger.log("Ошибка в checkWarranty: " + error.toString());
-    sendMessage(chatId, "⚠️ Произошла техническая ошибка. Пожалуйста, попробуйте позже.");
-    clearUserState(chatId);
+    
+    // Очищаем шаги
+    var props = PropertiesService.getScriptProperties();
+    props.deleteProperty(`warranty_step_${chatId}`);
+    props.deleteProperty(`warranty_date_${chatId}`);
+    props.deleteProperty(`warranty_model_${chatId}`);
+    
+    sendInlineButton(chatId);
+    
+  } catch(error) {
+    Logger.log(error);
+    sendMessage(chatId, "⚠️ Ошибка");
   } finally {
-    if (lockAcquired && lock.hasLock()) {
-      lock.releaseLock();
-    }
+    lock.releaseLock();
   }
 }
 
-// 📩 Обработка сообщений
+// 📩 Обработка сообщений (как в вашем примере)
 function handleMessage(msg) {
   if (!msg.text) return;
-  
   var chatId = msg.chat.id;
   var text = msg.text;
-
+  var userName = msg.from.first_name || "";
+  
   if (text === "/start") {
-    clearUserState(chatId);
+    var props = PropertiesService.getScriptProperties();
+    props.deleteProperty(`warranty_step_${chatId}`);
+    props.deleteProperty(`warranty_date_${chatId}`);
+    props.deleteProperty(`warranty_model_${chatId}`);
     sendInlineButton(chatId);
     return;
   }
-
-  var user = getUserState(chatId);
   
-  if (!user) {
-    sendMessage(chatId, "Пожалуйста, начните с команды /start");
+  // ✅ ТА ЖЕ ЛОГИКА, ЧТО И В ВАШЕМ ПРИМЕРЕ!
+  var warrantyStep = getWithTTL(`warranty_step_${chatId}`);
+  
+  if (warrantyStep === 'ask_model') {
+    setWithTTL(`warranty_model_${chatId}`, text, 300);
+    setWithTTL(`warranty_step_${chatId}`, 'ask_serial', 300);
+    sendMessage(chatId, "🔢 Введите серийный номер:");
     return;
   }
-
-  switch (user.state) {
-    case "WAIT_DATE_MANUAL":
-      if (!isValidDate(text)) {
-        sendMessage(chatId, "❗ Пожалуйста, введите дату в формате ГГГГ-ММ-ДД\nНапример: 2024-03-15");
-        return;
-      }
-      user.data.date = text;
-      setUserState(chatId, "WAIT_MODEL", user.data);
-      sendMessage(chatId, "📱 Пожалуйста, укажите модель устройства:");
-      break;
-
-    case "WAIT_MODEL":
-      if (!text || text.trim() === "") {
-        sendMessage(chatId, "❗ Пожалуйста, укажите модель устройства:");
-        return;
-      }
-      user.data.model = text;
-      setUserState(chatId, "WAIT_SERIAL", user.data);
-      sendMessage(chatId, "🔢 Пожалуйста, введите серийный номер:");
-      break;
-
-    case "WAIT_SERIAL":
-      if (text.length < 5) {
-        sendMessage(chatId, "❗ Серийный номер слишком короткий. Пожалуйста, введите полный серийный номер:");
-        return;
-      }
-      user.data.serial = text;
-      sendMessage(chatId, "🔍 Проверяем данные...");
-      checkWarranty(chatId, user.data);
-      break;
-      
-    default:
-      sendMessage(chatId, "⚠️ Неизвестная команда. Начните с /start");
-      clearUserState(chatId);
+  
+  if (warrantyStep === 'ask_serial') {
+    var serial = text;
+    var date = getWithTTL(`warranty_date_${chatId}`);
+    var model = getWithTTL(`warranty_model_${chatId}`);
+    
+    if (!date || !model) {
+      sendMessage(chatId, "❌ Сессия устарела. Нажмите /start");
+      return;
+    }
+    
+    sendMessage(chatId, "🔍 Проверяем...");
+    checkWarranty(chatId, date, model, serial, userName);
+    return;
   }
+  
+  // Ручной ввод даты
+  if (warrantyStep === 'ask_date_manual') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+      sendMessage(chatId, "❗ Формат: ГГГГ-ММ-ДД\nПример: 2024-03-15");
+      return;
+    }
+    setWithTTL(`warranty_date_${chatId}`, text, 300);
+    setWithTTL(`warranty_step_${chatId}`, 'ask_model', 300);
+    sendMessage(chatId, "📱 Укажите модель устройства:");
+    return;
+  }
+  
+  // Если нет активного шага
+  sendMessage(chatId, "Нажмите /start");
 }
 
-// 🔘 Обработка кнопок (ГЛАВНОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ)
+// 🔘 Обработка кнопок
 function handleCallback(query) {
-  // ✅ КРИТИЧЕСКИ ВАЖНО: используем chatId из сообщения, а не from.id
+  // Мгновенный ответ
+  try {
+    UrlFetchApp.fetch(TELEGRAM_URL + "/answerCallbackQuery", {
+      method: "post",
+      contentType: "application/json",
+      muteHttpExceptions: true,
+      payload: JSON.stringify({ callback_query_id: query.id })
+    });
+  } catch(e) {}
+  
   var chatId = query.message.chat.id;
   var data = query.data;
-
-  answerCallback(query.id);
-
-  // ✅ Защита от "чужого" callback (когда состояние не найдено)
-  var user = getUserState(chatId);
   
   if (data === "confirm_service") {
     sendDateButtons(chatId);
     return;
   }
-
-  // ✅ Проверяем, что сессия не устарела
-  if (data.startsWith("date_") || data === "manual_date") {
-    if (!user) {
-      sendMessage(chatId, "❗ Сессия устарела. Пожалуйста, нажмите /start и начните заново.");
-      return;
-    }
-  }
-
-  if (data.startsWith("date_")) {
-    var selectedDate = data.replace("date_", "");
-    setUserState(chatId, "WAIT_MODEL", { date: selectedDate });
-    sendMessage(chatId, "📱 Пожалуйста, укажите модель устройства:");
+  
+  if (data === "manual_date") {
+    setWithTTL(`warranty_step_${chatId}`, 'ask_date_manual', 300);
+    sendMessage(chatId, "✏️ Введите дату в формате ГГГГ-ММ-ДД\nПример: 2024-03-15");
     return;
   }
-
-  if (data === "manual_date") {
-    setUserState(chatId, "WAIT_DATE_MANUAL", {});
-    sendMessage(chatId, "✏️ Введите дату покупки вручную\nФормат: ГГГГ-ММ-ДД\nНапример: 2024-03-15");
+  
+  if (data.startsWith("date_")) {
+    var selectedDate = data.replace("date_", "");
+    setWithTTL(`warranty_date_${chatId}`, selectedDate, 300);
+    setWithTTL(`warranty_step_${chatId}`, 'ask_model', 300);
+    sendMessage(chatId, "📱 Укажите модель устройства:");
     return;
   }
 }
 
 // 🚀 doPost
 function doPost(e) {
-  var contents;
   try {
-    contents = JSON.parse(e.postData.contents);
-  } catch (err) {
-    Logger.log("Ошибка парсинга JSON: " + err.toString());
-    return ContentService.createTextOutput("invalid json");
-  }
-  
-  if (!contents.message && !contents.callback_query) {
-    return ContentService.createTextOutput("ok");
-  }
-  
-  // ✅ Обработка
-  if (contents.callback_query) {
-    handleCallback(contents.callback_query);
-  } else if (contents.message) {
-    handleMessage(contents.message);
-  }
-
-  // 📊 Веб-форма
-  if (contents.name && contents.phone) {
-    try {
-      var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName("Лист1");
-      if (sheet) {
-        sheet.appendRow([
-          contents.name,
-          contents.phone,
-          contents.comment || "",
-          new Date()
-        ]);
-      }
-    } catch (error) {
-      Logger.log("Ошибка записи в таблицу: " + error.toString());
+    var contents = JSON.parse(e.postData.contents);
+    
+    // Защита от дублей
+    var updateId = contents.update_id;
+    var props = PropertiesService.getScriptProperties();
+    var lastId = props.getProperty("last_update_id");
+    if (lastId && Number(updateId) <= Number(lastId)) {
+      return ContentService.createTextOutput("ok");
     }
+    props.setProperty("last_update_id", updateId);
+    
+    if (contents.callback_query) {
+      handleCallback(contents.callback_query);
+    } else if (contents.message) {
+      handleMessage(contents.message);
+    }
+    
+  } catch(e) {
+    Logger.log(e);
   }
-
+  
   return ContentService.createTextOutput("ok");
 }
