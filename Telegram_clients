@@ -1,322 +1,504 @@
-// ✅ ТОКЕН
+// ✅ CONFIG
 var TOKEN_CLIENTS = "8738738289:AAE2O-xRBq9uyejNdm4f-GE_WRmztDZ-H88";
 var TELEGRAM_URL = "https://api.telegram.org/bot" + TOKEN_CLIENTS;
 var SPREADSHEET_ID = "13-2uFUBPUBSgDisDutP-rBjxEzI04ZfOz1njYvlVf7A";
 var SHEET_NAME = "Доп Гарантия";
-var SESSION_TTL_SECONDS = 300;
-var WARRANTY_INDEX_CACHE_KEY = "warranty_open_rows_v1";
-var WARRANTY_INDEX_TTL_SECONDS = 60;
+
+// ✅ PERFORMANCE / BEHAVIOR
+var ROWS_CACHE_KEY = "warranty_rows_v2";
+var ROWS_CACHE_TTL_SECONDS = 60;
+var SESSION_TTL_SECONDS = 900; // 15 минут
 var UPDATE_DEDUP_TTL_SECONDS = 600;
+var REQUIRE_SERIAL = false; // true => включить шаг ask_serial
+var ADMIN_CHAT_ID = ""; // опционально: ID чата для логов ошибок
 
-// 📦 Функции с TTL (как в вашем примере)
-function setWithTTL(key, value, ttlSeconds) {
-  var cache = CacheService.getScriptCache();
-  cache.put(key, JSON.stringify(value), ttlSeconds);
-}
+// ✅ FSM steps
+var STEP_ASK_DATE = "ask_date";
+var STEP_ASK_DATE_MANUAL = "ask_date_manual";
+var STEP_ASK_CATEGORY = "ask_category";
+var STEP_ASK_ITEM = "ask_item";
+var STEP_ASK_SERIAL = "ask_serial";
 
-function getWithTTL(key) {
-  var cache = CacheService.getScriptCache();
-  var cached = cache.get(key);
-  if (cached) {
-    try { return JSON.parse(cached); } catch(e) {}
-  }
-
-  var props = PropertiesService.getScriptProperties();
-  var raw = props.getProperty(key);
-  if (!raw) return null;
-  try {
-    var data = JSON.parse(raw);
-    if (data.expires && Date.now() > data.expires) {
-      props.deleteProperty(key);
-      return null;
-    }
-    return data.value;
-  } catch(e) {
-    return null;
-  }
-}
-
-// 💬 Отправка сообщения
-function sendMessage(chatId, text) {
-  try {
-    UrlFetchApp.fetch(TELEGRAM_URL + "/sendMessage", {
-      method: "post",
-      contentType: "application/json",
-      muteHttpExceptions: true,
-      payload: JSON.stringify({ chat_id: chatId, text: text })
-    });
-  } catch(e) {}
-}
-
-// 🔘 Стартовая кнопка
-function sendInlineButton(chatId) {
-  UrlFetchApp.fetch(TELEGRAM_URL + "/sendMessage", {
+// =========================
+// Telegram API helpers
+// =========================
+function apiRequest(method, payload) {
+  return UrlFetchApp.fetch(TELEGRAM_URL + "/" + method, {
     method: "post",
     contentType: "application/json",
     muteHttpExceptions: true,
-    payload: JSON.stringify({
-      chat_id: chatId,
-      text: "🔧 Выберите действие:",
-      reply_markup: { inline_keyboard: [[{ text: "✅ Подтвердить серв. обслуживание", callback_data: "confirm_service" }]] }
-    })
+    payload: JSON.stringify(payload || {})
   });
 }
 
-// ✅ Нормализация
-function normalize(str) { return String(str).toLowerCase().replace(/\s+/g, ""); }
-function normalizeSerial(str) { return String(str).toUpperCase().replace(/\s+/g, ""); }
-function parsePrice(str) { return parseFloat(str.replace(',', '.')); }
-function buildSessionKey(chatId, userId, field) { return "warranty_" + field + "_" + chatId + "_" + userId; }
-function buildWarrantyLookupKey(date, model) { return date + "|" + normalize(model); }
+function sendMessage(chatId, text, replyMarkup) {
+  var payload = { chat_id: chatId, text: text };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  try { apiRequest("sendMessage", payload); } catch (e) {}
+}
+
+function answerCallback(callbackQueryId) {
+  try { apiRequest("answerCallbackQuery", { callback_query_id: callbackQueryId }); } catch (e) {}
+}
+
+function sendStartMenu(chatId) {
+  sendMessage(chatId, "🔧 Выберите действие:", {
+    inline_keyboard: [[{ text: "✅ Подтвердить гарантию", callback_data: "confirm_service" }]]
+  });
+}
+
+// =========================
+// Logging
+// =========================
+function logEvent(type, message) {
+  var line = "🧾 LOG:\n" + type + ": " + message;
+  Logger.log(line);
+}
+
+function logError(error, context) {
+  var line = "ERROR: " + (context || "unknown") + " | " + (error && error.message ? error.message : error);
+  logEvent("ERROR", line);
+  if (ADMIN_CHAT_ID) {
+    sendMessage(ADMIN_CHAT_ID, "⚠️ " + line);
+  }
+}
+
+// =========================
+// Utils
+// =========================
+function normalize(str) { return String(str || "").trim().toLowerCase(); }
+function normalizeSerial(str) { return String(str || "").trim().toUpperCase(); }
+function isValidDateFormat(str) { return /^\d{4}-\d{2}-\d{2}$/.test(String(str || "")); }
+
+function normalizeDateToYmd(value) {
+  var timezone = Session.getScriptTimeZone();
+  if (value instanceof Date) return Utilities.formatDate(value, timezone, "yyyy-MM-dd");
+  var raw = String(value || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  if (/^\d{2}\.\d{2}\.\d{4}$/.test(raw)) return raw.split(".").reverse().join("-");
+  return raw;
+}
+
+function isConfirmed(row) {
+  var serial = String(row.serial || "").trim();
+  var statusRaw = String(row.status || "").trim().toLowerCase();
+  return !!serial || row.status === true || statusRaw === "true" || statusRaw === "confirmed";
+}
+
+function buildSessionKey(chatId, userId) {
+  return "session_" + chatId + "_" + userId;
+}
+
+function getSession(chatId, userId) {
+  var key = buildSessionKey(chatId, userId);
+  var cached = CacheService.getScriptCache().get(key);
+  if (!cached) return {};
+  try { return JSON.parse(cached); } catch (e) { return {}; }
+}
+
+function saveSession(chatId, userId, sessionData) {
+  CacheService.getScriptCache().put(
+    buildSessionKey(chatId, userId),
+    JSON.stringify(sessionData || {}),
+    SESSION_TTL_SECONDS
+  );
+}
 
 function clearSession(chatId, userId) {
-  var props = PropertiesService.getScriptProperties();
-  var cache = CacheService.getScriptCache();
-  var keys = [
-    buildSessionKey(chatId, userId, "step"),
-    buildSessionKey(chatId, userId, "date"),
-    buildSessionKey(chatId, userId, "model")
-  ];
+  CacheService.getScriptCache().remove(buildSessionKey(chatId, userId));
+}
 
-  for (var i = 0; i < keys.length; i++) {
-    props.deleteProperty(keys[i]);
-    cache.remove(keys[i]);
+function invalidateRowsCache() {
+  CacheService.getScriptCache().remove(ROWS_CACHE_KEY);
+}
+
+// =========================
+// Sheets helpers
+// =========================
+function getSheet() {
+  var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+  if (!sheet) throw new Error("Sheet not found: " + SHEET_NAME);
+  return sheet;
+}
+
+function getAllRows() {
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get(ROWS_CACHE_KEY);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
+
+  var sheet = getSheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  var values = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
+  var rows = [];
+  for (var i = 0; i < values.length; i++) {
+    rows.push({
+      rowNumber: i + 2,
+      date: normalizeDateToYmd(values[i][0]),
+      category: String(values[i][1] || "").trim(),
+      item: String(values[i][2] || "").trim(),
+      serial: String(values[i][3] || "").trim(),
+      status: values[i][4]
+    });
+  }
+
+  cache.put(ROWS_CACHE_KEY, JSON.stringify(rows), ROWS_CACHE_TTL_SECONDS);
+  return rows;
+}
+
+function getAvailableDates(rows) {
+  var map = {};
+  for (var i = 0; i < rows.length; i++) {
+    if (!isConfirmed(rows[i]) && rows[i].date) map[rows[i].date] = true;
+  }
+  var dates = Object.keys(map).sort().reverse();
+  return dates.slice(0, 7);
+}
+
+function getCategoriesByDate(rows, date) {
+  var map = {};
+  for (var i = 0; i < rows.length; i++) {
+    if (!isConfirmed(rows[i]) && rows[i].date === date && rows[i].category) {
+      map[rows[i].category] = true;
+    }
+  }
+  return Object.keys(map).sort();
+}
+
+function getItemsByDateCategory(rows, date, category) {
+  var items = [];
+  for (var i = 0; i < rows.length; i++) {
+    if (!isConfirmed(rows[i]) && rows[i].date === date && rows[i].category === category && rows[i].item) {
+      items.push({ rowNumber: rows[i].rowNumber, item: rows[i].item });
+    }
+  }
+  return items;
+}
+
+function encodeCategory(category) {
+  return encodeURIComponent(category);
+}
+
+function decodeCategory(value) {
+  try { return decodeURIComponent(value); } catch (e) { return ""; }
+}
+
+function confirmWarrantyByRow(rowNumber, serial) {
+  var lock = LockService.getDocumentLock();
+  if (!lock.tryLock(2000)) throw new Error("Lock timeout");
+
+  try {
+    var sheet = getSheet();
+    var row = sheet.getRange(rowNumber, 1, 1, 5).getValues()[0];
+    var current = {
+      date: normalizeDateToYmd(row[0]),
+      category: String(row[1] || "").trim(),
+      item: String(row[2] || "").trim(),
+      serial: String(row[3] || "").trim(),
+      status: row[4]
+    };
+
+    if (isConfirmed(current)) {
+      return { ok: false, reason: "already_confirmed" };
+    }
+
+    sheet.getRange(rowNumber, 4, 1, 2).setValues([[normalizeSerial(serial), true]]);
+    invalidateRowsCache();
+    return { ok: true };
+  } finally {
+    lock.releaseLock();
   }
 }
 
-// 📅 Кнопки с датами
-function sendDateButtons(chatId) {
+// =========================
+// UX blocks
+// =========================
+function showDatePicker(chatId) {
+  var rows = getAllRows();
+  var dates = getAvailableDates(rows);
   var buttons = [];
-  var timezone = Session.getScriptTimeZone();
-  var today = new Date();
-  
-  for (var i = 0; i < 7; i++) {
-    var d = new Date();
-    d.setDate(today.getDate() - i);
-    var formatted = Utilities.formatDate(d, timezone, "yyyy-MM-dd");
-    buttons.push([{ text: formatted, callback_data: "date_" + formatted }]);
+
+  for (var i = 0; i < dates.length; i++) {
+    buttons.push([{ text: dates[i], callback_data: "date_" + dates[i] }]);
   }
   buttons.push([{ text: "✏️ Ввести вручную", callback_data: "manual_date" }]);
-  
-  sendMessage(chatId, "📅 Выберите дату покупки:");
-  // Отправляем кнопки отдельным сообщением
-  UrlFetchApp.fetch(TELEGRAM_URL + "/sendMessage", {
-    method: "post",
-    contentType: "application/json",
-    muteHttpExceptions: true,
-    payload: JSON.stringify({
-      chat_id: chatId,
-      text: "👇 Нажмите на дату:",
-      reply_markup: { inline_keyboard: buttons }
-    })
-  });
+
+  sendMessage(chatId, "📅 Выберите дату покупки:", { inline_keyboard: buttons });
 }
 
-// 🔎 Проверка гарантии (быстрая)
-function getOpenWarrantyRowsMap(sheet) {
-  var cache = CacheService.getScriptCache();
-  var cached = cache.get(WARRANTY_INDEX_CACHE_KEY);
-  if (cached) {
-    try { return JSON.parse(cached); } catch(e) {}
+function showCategories(chatId, date) {
+  var rows = getAllRows();
+  var categories = getCategoriesByDate(rows, date);
+
+  if (!categories.length) {
+    sendMessage(chatId, "❌ Заказы за эту дату не найдены");
+    sendStartMenu(chatId);
+    return false;
   }
 
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return {};
-
-  var data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
-  var timezone = Session.getScriptTimeZone();
-  var rowsMap = {};
-
-  for (var i = 0; i < data.length; i++) {
-    var rowDate = data[i][0] instanceof Date ?
-      Utilities.formatDate(data[i][0], timezone, "yyyy-MM-dd") :
-      String(data[i][0]).split('.').reverse().join('-');
-    var model = normalize(data[i][1]);
-    var serial = String(data[i][2]).trim();
-
-    if (!serial && rowDate && model) {
-      var key = buildWarrantyLookupKey(rowDate, model);
-      if (!rowsMap[key]) rowsMap[key] = i + 2;
-    }
+  var buttons = [];
+  for (var i = 0; i < categories.length; i++) {
+    buttons.push([{
+      text: categories[i],
+      callback_data: "category_" + encodeCategory(categories[i])
+    }]);
   }
 
-  cache.put(WARRANTY_INDEX_CACHE_KEY, JSON.stringify(rowsMap), WARRANTY_INDEX_TTL_SECONDS);
-  return rowsMap;
+  sendMessage(chatId, "📦 Выберите категорию:", { inline_keyboard: buttons });
+  return true;
 }
 
-function invalidateWarrantyRowsCache() {
-  CacheService.getScriptCache().remove(WARRANTY_INDEX_CACHE_KEY);
-}
+function showItems(chatId, date, category) {
+  var rows = getAllRows();
+  var items = getItemsByDateCategory(rows, date, category);
 
-function checkWarranty(chatId, date, model, serial) {
-  try {
-    var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
-    if (!sheet) {
-      sendMessage(chatId, "⚠️ Ошибка: лист не найден");
-      sendInlineButton(chatId);
-      return;
-    }
-
-    var row = getOpenWarrantyRowsMap(sheet)[buildWarrantyLookupKey(date, model)] || -1;
-    if (row !== -1) {
-      var lock = LockService.getDocumentLock();
-      if (!lock.tryLock(1500)) {
-        sendMessage(chatId, "⏳ Система занята, попробуйте ещё раз");
-        return;
-      }
-
-      try {
-        var existingSerial = String(sheet.getRange(row, 3).getValue()).trim();
-        if (existingSerial) {
-          sendMessage(chatId, "⚠️ Гарантия уже подтверждена");
-          return;
-        }
-
-        sheet.getRange(row, 3, 1, 2).setValues([[normalizeSerial(serial), true]]);
-        invalidateWarrantyRowsCache();
-        sendMessage(chatId, "✅ Гарантия подтверждена!\nСпасибо!");
-      } finally {
-        lock.releaseLock();
-      }
-    } else {
-      sendMessage(chatId, "❌ Данные не найдены.\nПроверьте дату и модель");
-    }
-
-  } catch(error) {
-    Logger.log(error);
-    sendMessage(chatId, "⚠️ Ошибка");
+  if (!items.length) {
+    sendMessage(chatId, "❌ Товары не найдены для выбранной категории");
+    sendStartMenu(chatId);
+    return false;
   }
+
+  var buttons = [];
+  for (var i = 0; i < items.length; i++) {
+    buttons.push([{ text: items[i].item, callback_data: "item_" + items[i].rowNumber }]);
+  }
+
+  sendMessage(chatId, "📱 Выберите товар:", { inline_keyboard: buttons });
+  return true;
 }
 
-// 📩 Обработка сообщений (как в вашем примере)
+// =========================
+// Message handling
+// =========================
+function handleStart(chatId, userId) {
+  clearSession(chatId, userId);
+  sendStartMenu(chatId);
+}
+
+function handleManualDateInput(chatId, userId, text) {
+  if (!isValidDateFormat(text)) {
+    sendMessage(chatId, "❗ Неверный формат даты");
+    return;
+  }
+
+  var session = getSession(chatId, userId);
+  session.step = STEP_ASK_CATEGORY;
+  session.date = text;
+  saveSession(chatId, userId, session);
+
+  var ok = showCategories(chatId, text);
+  if (!ok) clearSession(chatId, userId);
+}
+
+function handleSerialInput(chatId, userId, text) {
+  var session = getSession(chatId, userId);
+  if (session.step !== STEP_ASK_SERIAL || !session.rowNumber) {
+    sendMessage(chatId, "Нажмите /start");
+    return;
+  }
+
+  var result = confirmWarrantyByRow(Number(session.rowNumber), text || "");
+  if (result.ok) {
+    sendMessage(chatId, "✅ Ваша гарантия подтверждена!");
+  } else {
+    sendMessage(chatId, "⚠️ Гарантия уже была подтверждена ранее");
+  }
+
+  clearSession(chatId, userId);
+  sendStartMenu(chatId);
+}
+
 function handleMessage(msg) {
-  if (!msg.text) return;
   var chatId = msg.chat.id;
   var userId = msg.from.id;
-  var text = msg.text;
-  
+  var text = String(msg.text || "");
+  logEvent("MSG", text);
+
   if (text === "/start") {
-    clearSession(chatId, userId);
-    sendInlineButton(chatId);
+    handleStart(chatId, userId);
     return;
   }
-  
-  // ✅ ТА ЖЕ ЛОГИКА, ЧТО И В ВАШЕМ ПРИМЕРЕ!
-  var stepKey = buildSessionKey(chatId, userId, "step");
-  var dateKey = buildSessionKey(chatId, userId, "date");
-  var modelKey = buildSessionKey(chatId, userId, "model");
-  var warrantyStep = getWithTTL(stepKey);
-  
-  if (warrantyStep === 'ask_model') {
-    setWithTTL(modelKey, text, SESSION_TTL_SECONDS);
-    setWithTTL(stepKey, 'ask_serial', SESSION_TTL_SECONDS);
-    sendMessage(chatId, "🔢 Введите серийный номер:");
+
+  var session = getSession(chatId, userId);
+  if (session.step === STEP_ASK_DATE_MANUAL) {
+    handleManualDateInput(chatId, userId, text);
     return;
   }
-  
-  if (warrantyStep === 'ask_serial') {
-    var serial = text;
-    var date = getWithTTL(dateKey);
-    var model = getWithTTL(modelKey);
-    
-    if (!date || !model) {
-      sendMessage(chatId, "❌ Сессия устарела. Нажмите /start");
-      return;
-    }
-    
-    sendMessage(chatId, "🔍 Проверяем...");
-    checkWarranty(chatId, date, model, serial);
-    clearSession(chatId, userId);
-    sendInlineButton(chatId);
+
+  if (session.step === STEP_ASK_SERIAL) {
+    handleSerialInput(chatId, userId, text);
     return;
   }
-  
-  // Ручной ввод даты
-  if (warrantyStep === 'ask_date_manual') {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
-      sendMessage(chatId, "❗ Формат: ГГГГ-ММ-ДД\nПример: 2024-03-15");
-      return;
-    }
-    setWithTTL(dateKey, text, SESSION_TTL_SECONDS);
-    setWithTTL(stepKey, 'ask_model', SESSION_TTL_SECONDS);
-    sendMessage(chatId, "📱 Укажите модель устройства:");
-    return;
-  }
-  
-  // Если нет активного шага
+
   sendMessage(chatId, "Нажмите /start");
 }
 
-// 🔘 Обработка кнопок
+// =========================
+// Callback handling
+// =========================
+function handleDateSelected(chatId, userId, date) {
+  if (!isValidDateFormat(date)) {
+    sendMessage(chatId, "❗ Неверный формат даты");
+    return;
+  }
+
+  var session = getSession(chatId, userId);
+  session.step = STEP_ASK_CATEGORY;
+  session.date = date;
+  delete session.category;
+  delete session.rowNumber;
+  saveSession(chatId, userId, session);
+
+  var ok = showCategories(chatId, date);
+  if (!ok) clearSession(chatId, userId);
+}
+
+function handleCategorySelected(chatId, userId, encodedCategory) {
+  var session = getSession(chatId, userId);
+  if (session.step !== STEP_ASK_CATEGORY || !session.date) {
+    sendMessage(chatId, "Нажмите /start");
+    return;
+  }
+
+  var category = decodeCategory(encodedCategory);
+  if (!category) {
+    sendMessage(chatId, "⚠️ Некорректная категория");
+    return;
+  }
+
+  session.step = STEP_ASK_ITEM;
+  session.category = category;
+  delete session.rowNumber;
+  saveSession(chatId, userId, session);
+
+  var ok = showItems(chatId, session.date, category);
+  if (!ok) clearSession(chatId, userId);
+}
+
+function handleItemSelected(chatId, userId, rowNumberRaw) {
+  var session = getSession(chatId, userId);
+  if (session.step !== STEP_ASK_ITEM || !session.date || !session.category) {
+    sendMessage(chatId, "Нажмите /start");
+    return;
+  }
+
+  var rowNumber = Number(rowNumberRaw);
+  if (!rowNumber) {
+    sendMessage(chatId, "⚠️ Некорректный товар");
+    return;
+  }
+
+  var rows = getAllRows();
+  var found = null;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].rowNumber === rowNumber) {
+      found = rows[i];
+      break;
+    }
+  }
+
+  if (!found || isConfirmed(found) || found.date !== session.date || found.category !== session.category) {
+    sendMessage(chatId, "⚠️ Товар недоступен для подтверждения");
+    clearSession(chatId, userId);
+    sendStartMenu(chatId);
+    return;
+  }
+
+  if (REQUIRE_SERIAL) {
+    session.step = STEP_ASK_SERIAL;
+    session.rowNumber = rowNumber;
+    saveSession(chatId, userId, session);
+    sendMessage(chatId, "🔢 Введите серийный номер:");
+    return;
+  }
+
+  var result = confirmWarrantyByRow(rowNumber, "");
+  if (result.ok) {
+    sendMessage(chatId, "✅ Ваша гарантия подтверждена!");
+  } else {
+    sendMessage(chatId, "⚠️ Гарантия уже была подтверждена ранее");
+  }
+
+  clearSession(chatId, userId);
+  sendStartMenu(chatId);
+}
+
 function handleCallback(query) {
-  try {
-    // Мгновенный ответ, чтобы убрать "часики" в Telegram
-    UrlFetchApp.fetch(TELEGRAM_URL + "/answerCallbackQuery", {
-      method: "post",
-      contentType: "application/json",
-      muteHttpExceptions: true,
-      payload: JSON.stringify({ callback_query_id: query.id })
-    });
+  answerCallback(query.id); // максимально быстрый ACK
 
-    if (!query.message || !query.message.chat) return;
+  var chatId = query && query.message && query.message.chat ? query.message.chat.id : null;
+  var userId = query && query.from ? query.from.id : null;
+  var data = String(query.data || "");
+  if (!chatId || !userId) return;
 
-    var chatId = query.message.chat.id;
-    var userId = query.from.id;
-    var data = query.data || "";
-    var stepKey = buildSessionKey(chatId, userId, "step");
-    var dateKey = buildSessionKey(chatId, userId, "date");
+  logEvent("CALLBACK", data);
 
-    if (data === "confirm_service") {
-      sendDateButtons(chatId);
-      return;
-    }
+  if (data === "confirm_service") {
+    saveSession(chatId, userId, { step: STEP_ASK_DATE });
+    showDatePicker(chatId);
+    return;
+  }
 
-    if (data === "manual_date") {
-      setWithTTL(stepKey, 'ask_date_manual', SESSION_TTL_SECONDS);
-      sendMessage(chatId, "✏️ Введите дату в формате ГГГГ-ММ-ДД\nПример: 2024-03-15");
-      return;
-    }
+  if (data === "manual_date") {
+    saveSession(chatId, userId, { step: STEP_ASK_DATE_MANUAL });
+    sendMessage(chatId, "✏️ Введите дату в формате YYYY-MM-DD");
+    return;
+  }
 
-    if (data.startsWith("date_")) {
-      var selectedDate = data.replace("date_", "");
-      setWithTTL(dateKey, selectedDate, SESSION_TTL_SECONDS);
-      setWithTTL(stepKey, 'ask_model', SESSION_TTL_SECONDS);
-      sendMessage(chatId, "📱 Укажите модель устройства:");
-      return;
-    }
-  } catch (e) {
-    Logger.log(e);
-    if (query && query.message && query.message.chat) {
-      sendMessage(query.message.chat.id, "⚠️ Не удалось обработать выбор. Нажмите /start");
-    }
+  if (data.indexOf("date_") === 0) {
+    handleDateSelected(chatId, userId, data.replace("date_", ""));
+    return;
+  }
+
+  if (data.indexOf("category_") === 0) {
+    handleCategorySelected(chatId, userId, data.replace("category_", ""));
+    return;
+  }
+
+  if (data.indexOf("item_") === 0) {
+    handleItemSelected(chatId, userId, data.replace("item_", ""));
   }
 }
 
-// 🚀 doPost
+// =========================
+// Webhook entrypoint
+// =========================
+function isDuplicateUpdate(updateId) {
+  if (updateId === undefined || updateId === null) return false;
+  var key = "update_id_" + updateId;
+  var cache = CacheService.getScriptCache();
+  if (cache.get(key)) return true;
+  cache.put(key, "1", UPDATE_DEDUP_TTL_SECONDS);
+  return false;
+}
+
 function doPost(e) {
   try {
-    var contents = JSON.parse(e.postData.contents);
-    
-    // Защита от дублей
-    var updateId = contents.update_id;
-    if (updateId !== undefined && updateId !== null) {
-      var dedupKey = "update_id_" + updateId;
-      var dedupCache = CacheService.getScriptCache();
-      if (dedupCache.get(dedupKey)) {
-        return ContentService.createTextOutput("ok");
+    var payload = JSON.parse(e.postData.contents || "{}");
+    if (isDuplicateUpdate(payload.update_id)) {
+      return ContentService.createTextOutput("ok");
+    }
+
+    if (payload.callback_query) {
+      handleCallback(payload.callback_query);
+    } else if (payload.message) {
+      handleMessage(payload.message);
+    }
+  } catch (err) {
+    logError(err, "doPost");
+    try {
+      if (e && e.postData && e.postData.contents) {
+        var fallback = JSON.parse(e.postData.contents);
+        var chatId = fallback && fallback.message && fallback.message.chat ? fallback.message.chat.id : null;
+        if (chatId) sendMessage(chatId, "⚠️ Произошла ошибка. Попробуйте позже.");
       }
-      dedupCache.put(dedupKey, "1", UPDATE_DEDUP_TTL_SECONDS);
+    } catch (nested) {
+      logError(nested, "doPost_fallback");
     }
-    
-    if (contents.callback_query) {
-      handleCallback(contents.callback_query);
-    } else if (contents.message) {
-      handleMessage(contents.message);
-    }
-    
-  } catch(e) {
-    Logger.log(e);
   }
-  
+
   return ContentService.createTextOutput("ok");
 }
