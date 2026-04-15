@@ -12,12 +12,6 @@ var UPDATE_DEDUP_TTL_SECONDS = 600;
 function setWithTTL(key, value, ttlSeconds) {
   var cache = CacheService.getScriptCache();
   cache.put(key, JSON.stringify(value), ttlSeconds);
-
-  var props = PropertiesService.getScriptProperties();
-  props.setProperty(key, JSON.stringify({
-    value: value,
-    expires: Date.now() + (ttlSeconds * 1000)
-  }));
 }
 
 function getWithTTL(key) {
@@ -255,39 +249,46 @@ function handleMessage(msg) {
 
 // 🔘 Обработка кнопок
 function handleCallback(query) {
-  // Мгновенный ответ
   try {
+    // Мгновенный ответ, чтобы убрать "часики" в Telegram
     UrlFetchApp.fetch(TELEGRAM_URL + "/answerCallbackQuery", {
       method: "post",
       contentType: "application/json",
       muteHttpExceptions: true,
       payload: JSON.stringify({ callback_query_id: query.id })
     });
-  } catch(e) {}
-  
-  var chatId = query.message.chat.id;
-  var userId = query.from.id;
-  var data = query.data;
-  var stepKey = buildSessionKey(chatId, userId, "step");
-  var dateKey = buildSessionKey(chatId, userId, "date");
-  
-  if (data === "confirm_service") {
-    sendDateButtons(chatId);
-    return;
-  }
-  
-  if (data === "manual_date") {
-    setWithTTL(stepKey, 'ask_date_manual', SESSION_TTL_SECONDS);
-    sendMessage(chatId, "✏️ Введите дату в формате ГГГГ-ММ-ДД\nПример: 2024-03-15");
-    return;
-  }
-  
-  if (data.startsWith("date_")) {
-    var selectedDate = data.replace("date_", "");
-    setWithTTL(dateKey, selectedDate, SESSION_TTL_SECONDS);
-    setWithTTL(stepKey, 'ask_model', SESSION_TTL_SECONDS);
-    sendMessage(chatId, "📱 Укажите модель устройства:");
-    return;
+
+    if (!query.message || !query.message.chat) return;
+
+    var chatId = query.message.chat.id;
+    var userId = query.from.id;
+    var data = query.data || "";
+    var stepKey = buildSessionKey(chatId, userId, "step");
+    var dateKey = buildSessionKey(chatId, userId, "date");
+
+    if (data === "confirm_service") {
+      sendDateButtons(chatId);
+      return;
+    }
+
+    if (data === "manual_date") {
+      setWithTTL(stepKey, 'ask_date_manual', SESSION_TTL_SECONDS);
+      sendMessage(chatId, "✏️ Введите дату в формате ГГГГ-ММ-ДД\nПример: 2024-03-15");
+      return;
+    }
+
+    if (data.startsWith("date_")) {
+      var selectedDate = data.replace("date_", "");
+      setWithTTL(dateKey, selectedDate, SESSION_TTL_SECONDS);
+      setWithTTL(stepKey, 'ask_model', SESSION_TTL_SECONDS);
+      sendMessage(chatId, "📱 Укажите модель устройства:");
+      return;
+    }
+  } catch (e) {
+    Logger.log(e);
+    if (query && query.message && query.message.chat) {
+      sendMessage(query.message.chat.id, "⚠️ Не удалось обработать выбор. Нажмите /start");
+    }
   }
 }
 
@@ -298,12 +299,14 @@ function doPost(e) {
     
     // Защита от дублей
     var updateId = contents.update_id;
-    var dedupKey = "update_id_" + updateId;
-    var dedupCache = CacheService.getScriptCache();
-    if (dedupCache.get(dedupKey)) {
-      return ContentService.createTextOutput("ok");
+    if (updateId !== undefined && updateId !== null) {
+      var dedupKey = "update_id_" + updateId;
+      var dedupCache = CacheService.getScriptCache();
+      if (dedupCache.get(dedupKey)) {
+        return ContentService.createTextOutput("ok");
+      }
+      dedupCache.put(dedupKey, "1", UPDATE_DEDUP_TTL_SECONDS);
     }
-    dedupCache.put(dedupKey, "1", UPDATE_DEDUP_TTL_SECONDS);
     
     if (contents.callback_query) {
       handleCallback(contents.callback_query);
