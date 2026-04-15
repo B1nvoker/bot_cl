@@ -2,9 +2,17 @@
 var TOKEN_CLIENTS = "8738738289:AAE2O-xRBq9uyejNdm4f-GE_WRmztDZ-H88";
 var TELEGRAM_URL = "https://api.telegram.org/bot" + TOKEN_CLIENTS;
 var SPREADSHEET_ID = "13-2uFUBPUBSgDisDutP-rBjxEzI04ZfOz1njYvlVf7A";
+var SHEET_NAME = "Доп Гарантия";
+var SESSION_TTL_SECONDS = 300;
+var WARRANTY_INDEX_CACHE_KEY = "warranty_open_rows_v1";
+var WARRANTY_INDEX_TTL_SECONDS = 60;
+var UPDATE_DEDUP_TTL_SECONDS = 600;
 
 // 📦 Функции с TTL (как в вашем примере)
 function setWithTTL(key, value, ttlSeconds) {
+  var cache = CacheService.getScriptCache();
+  cache.put(key, JSON.stringify(value), ttlSeconds);
+
   var props = PropertiesService.getScriptProperties();
   props.setProperty(key, JSON.stringify({
     value: value,
@@ -13,6 +21,12 @@ function setWithTTL(key, value, ttlSeconds) {
 }
 
 function getWithTTL(key) {
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get(key);
+  if (cached) {
+    try { return JSON.parse(cached); } catch(e) {}
+  }
+
   var props = PropertiesService.getScriptProperties();
   var raw = props.getProperty(key);
   if (!raw) return null;
@@ -58,6 +72,23 @@ function sendInlineButton(chatId) {
 function normalize(str) { return String(str).toLowerCase().replace(/\s+/g, ""); }
 function normalizeSerial(str) { return String(str).toUpperCase().replace(/\s+/g, ""); }
 function parsePrice(str) { return parseFloat(str.replace(',', '.')); }
+function buildSessionKey(chatId, userId, field) { return "warranty_" + field + "_" + chatId + "_" + userId; }
+function buildWarrantyLookupKey(date, model) { return date + "|" + normalize(model); }
+
+function clearSession(chatId, userId) {
+  var props = PropertiesService.getScriptProperties();
+  var cache = CacheService.getScriptCache();
+  var keys = [
+    buildSessionKey(chatId, userId, "step"),
+    buildSessionKey(chatId, userId, "date"),
+    buildSessionKey(chatId, userId, "model")
+  ];
+
+  for (var i = 0; i < keys.length; i++) {
+    props.deleteProperty(keys[i]);
+    cache.remove(keys[i]);
+  }
+}
 
 // 📅 Кнопки с датами
 function sendDateButtons(chatId) {
@@ -88,64 +119,78 @@ function sendDateButtons(chatId) {
 }
 
 // 🔎 Проверка гарантии (быстрая)
-function checkWarranty(chatId, date, model, serial, userName) {
-  var lock = LockService.getScriptLock();
-  if (!lock.tryLock(2000)) {
-    sendMessage(chatId, "⏳ Система занята, попробуйте ещё раз");
-    return;
+function getOpenWarrantyRowsMap(sheet) {
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get(WARRANTY_INDEX_CACHE_KEY);
+  if (cached) {
+    try { return JSON.parse(cached); } catch(e) {}
   }
-  
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return {};
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+  var timezone = Session.getScriptTimeZone();
+  var rowsMap = {};
+
+  for (var i = 0; i < data.length; i++) {
+    var rowDate = data[i][0] instanceof Date ?
+      Utilities.formatDate(data[i][0], timezone, "yyyy-MM-dd") :
+      String(data[i][0]).split('.').reverse().join('-');
+    var model = normalize(data[i][1]);
+    var serial = String(data[i][2]).trim();
+
+    if (!serial && rowDate && model) {
+      var key = buildWarrantyLookupKey(rowDate, model);
+      if (!rowsMap[key]) rowsMap[key] = i + 2;
+    }
+  }
+
+  cache.put(WARRANTY_INDEX_CACHE_KEY, JSON.stringify(rowsMap), WARRANTY_INDEX_TTL_SECONDS);
+  return rowsMap;
+}
+
+function invalidateWarrantyRowsCache() {
+  CacheService.getScriptCache().remove(WARRANTY_INDEX_CACHE_KEY);
+}
+
+function checkWarranty(chatId, date, model, serial) {
   try {
-    var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName("Доп Гарантия");
+    var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
     if (!sheet) {
       sendMessage(chatId, "⚠️ Ошибка: лист не найден");
       sendInlineButton(chatId);
       return;
     }
-    
-    var lastRow = sheet.getLastRow();
-    var data = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
-    var foundRow = -1;
-    var timezone = Session.getScriptTimeZone();
-    
-    for (var i = 0; i < data.length; i++) {
-      var rowDate = data[i][0] instanceof Date ? 
-        Utilities.formatDate(data[i][0], timezone, "yyyy-MM-dd") : 
-        String(data[i][0]).split('.').reverse().join('-');
-      
-      if (rowDate === date && 
-          normalize(data[i][1]) === normalize(model) && 
-          !String(data[i][2]).trim()) {
-        foundRow = i;
-        break;
+
+    var row = getOpenWarrantyRowsMap(sheet)[buildWarrantyLookupKey(date, model)] || -1;
+    if (row !== -1) {
+      var lock = LockService.getDocumentLock();
+      if (!lock.tryLock(1500)) {
+        sendMessage(chatId, "⏳ Система занята, попробуйте ещё раз");
+        return;
       }
-    }
-    
-    if (foundRow !== -1) {
-      var row = foundRow + 2;
-      if (sheet.getRange(row, 4).getValue() === true) {
-        sendMessage(chatId, "⚠️ Гарантия уже подтверждена");
-      } else {
+
+      try {
+        var existingSerial = String(sheet.getRange(row, 3).getValue()).trim();
+        if (existingSerial) {
+          sendMessage(chatId, "⚠️ Гарантия уже подтверждена");
+          return;
+        }
+
         sheet.getRange(row, 3, 1, 2).setValues([[normalizeSerial(serial), true]]);
+        invalidateWarrantyRowsCache();
         sendMessage(chatId, "✅ Гарантия подтверждена!\nСпасибо!");
+      } finally {
+        lock.releaseLock();
       }
     } else {
       sendMessage(chatId, "❌ Данные не найдены.\nПроверьте дату и модель");
     }
-    
-    // Очищаем шаги
-    var props = PropertiesService.getScriptProperties();
-    props.deleteProperty(`warranty_step_${chatId}`);
-    props.deleteProperty(`warranty_date_${chatId}`);
-    props.deleteProperty(`warranty_model_${chatId}`);
-    
-    sendInlineButton(chatId);
-    
+
   } catch(error) {
     Logger.log(error);
     sendMessage(chatId, "⚠️ Ошибка");
-  } finally {
-    lock.releaseLock();
   }
 }
 
@@ -153,32 +198,32 @@ function checkWarranty(chatId, date, model, serial, userName) {
 function handleMessage(msg) {
   if (!msg.text) return;
   var chatId = msg.chat.id;
+  var userId = msg.from.id;
   var text = msg.text;
-  var userName = msg.from.first_name || "";
   
   if (text === "/start") {
-    var props = PropertiesService.getScriptProperties();
-    props.deleteProperty(`warranty_step_${chatId}`);
-    props.deleteProperty(`warranty_date_${chatId}`);
-    props.deleteProperty(`warranty_model_${chatId}`);
+    clearSession(chatId, userId);
     sendInlineButton(chatId);
     return;
   }
   
   // ✅ ТА ЖЕ ЛОГИКА, ЧТО И В ВАШЕМ ПРИМЕРЕ!
-  var warrantyStep = getWithTTL(`warranty_step_${chatId}`);
+  var stepKey = buildSessionKey(chatId, userId, "step");
+  var dateKey = buildSessionKey(chatId, userId, "date");
+  var modelKey = buildSessionKey(chatId, userId, "model");
+  var warrantyStep = getWithTTL(stepKey);
   
   if (warrantyStep === 'ask_model') {
-    setWithTTL(`warranty_model_${chatId}`, text, 300);
-    setWithTTL(`warranty_step_${chatId}`, 'ask_serial', 300);
+    setWithTTL(modelKey, text, SESSION_TTL_SECONDS);
+    setWithTTL(stepKey, 'ask_serial', SESSION_TTL_SECONDS);
     sendMessage(chatId, "🔢 Введите серийный номер:");
     return;
   }
   
   if (warrantyStep === 'ask_serial') {
     var serial = text;
-    var date = getWithTTL(`warranty_date_${chatId}`);
-    var model = getWithTTL(`warranty_model_${chatId}`);
+    var date = getWithTTL(dateKey);
+    var model = getWithTTL(modelKey);
     
     if (!date || !model) {
       sendMessage(chatId, "❌ Сессия устарела. Нажмите /start");
@@ -186,7 +231,9 @@ function handleMessage(msg) {
     }
     
     sendMessage(chatId, "🔍 Проверяем...");
-    checkWarranty(chatId, date, model, serial, userName);
+    checkWarranty(chatId, date, model, serial);
+    clearSession(chatId, userId);
+    sendInlineButton(chatId);
     return;
   }
   
@@ -196,8 +243,8 @@ function handleMessage(msg) {
       sendMessage(chatId, "❗ Формат: ГГГГ-ММ-ДД\nПример: 2024-03-15");
       return;
     }
-    setWithTTL(`warranty_date_${chatId}`, text, 300);
-    setWithTTL(`warranty_step_${chatId}`, 'ask_model', 300);
+    setWithTTL(dateKey, text, SESSION_TTL_SECONDS);
+    setWithTTL(stepKey, 'ask_model', SESSION_TTL_SECONDS);
     sendMessage(chatId, "📱 Укажите модель устройства:");
     return;
   }
@@ -219,7 +266,10 @@ function handleCallback(query) {
   } catch(e) {}
   
   var chatId = query.message.chat.id;
+  var userId = query.from.id;
   var data = query.data;
+  var stepKey = buildSessionKey(chatId, userId, "step");
+  var dateKey = buildSessionKey(chatId, userId, "date");
   
   if (data === "confirm_service") {
     sendDateButtons(chatId);
@@ -227,15 +277,15 @@ function handleCallback(query) {
   }
   
   if (data === "manual_date") {
-    setWithTTL(`warranty_step_${chatId}`, 'ask_date_manual', 300);
+    setWithTTL(stepKey, 'ask_date_manual', SESSION_TTL_SECONDS);
     sendMessage(chatId, "✏️ Введите дату в формате ГГГГ-ММ-ДД\nПример: 2024-03-15");
     return;
   }
   
   if (data.startsWith("date_")) {
     var selectedDate = data.replace("date_", "");
-    setWithTTL(`warranty_date_${chatId}`, selectedDate, 300);
-    setWithTTL(`warranty_step_${chatId}`, 'ask_model', 300);
+    setWithTTL(dateKey, selectedDate, SESSION_TTL_SECONDS);
+    setWithTTL(stepKey, 'ask_model', SESSION_TTL_SECONDS);
     sendMessage(chatId, "📱 Укажите модель устройства:");
     return;
   }
@@ -248,12 +298,12 @@ function doPost(e) {
     
     // Защита от дублей
     var updateId = contents.update_id;
-    var props = PropertiesService.getScriptProperties();
-    var lastId = props.getProperty("last_update_id");
-    if (lastId && Number(updateId) <= Number(lastId)) {
+    var dedupKey = "update_id_" + updateId;
+    var dedupCache = CacheService.getScriptCache();
+    if (dedupCache.get(dedupKey)) {
       return ContentService.createTextOutput("ok");
     }
-    props.setProperty("last_update_id", updateId);
+    dedupCache.put(dedupKey, "1", UPDATE_DEDUP_TTL_SECONDS);
     
     if (contents.callback_query) {
       handleCallback(contents.callback_query);
