@@ -502,3 +502,31 @@ function doPost(e) {
 
   return ContentService.createTextOutput("ok");
 }
+
+
+function pollTelegram() {
+  var url = TELEGRAM_URL + "/getUpdates";
+  var response = UrlFetchApp.fetch(url);
+  var data = JSON.parse(response.getContentText());
+
+  if (!data.result || !data.result.length) return;
+
+  for (var i = 0; i < data.result.length; i++) {
+    var update = data.result[i];
+
+    if (isDuplicateUpdate(update.update_id)) continue;
+
+    try {
+      if (update.callback_query) {
+        handleCallback(update.callback_query);
+      } else if (update.message) {
+        handleMessage(update.message);
+      }
+    } catch (e) {
+      logError(e, "pollTelegram");
+    }
+
+    // подтверждаем получение
+    UrlFetchApp.fetch(TELEGRAM_URL + "/getUpdates?offset=" + (update.update_id + 1));
+  }
+}
