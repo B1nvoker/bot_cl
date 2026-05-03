@@ -1,532 +1,548 @@
-// ✅ CONFIG
-var TOKEN_CLIENTS = "8738738289:AAE2O-xRBq9uyejNdm4f-GE_WRmztDZ-H88";
-var TELEGRAM_URL = "https://api.telegram.org/bot" + TOKEN_CLIENTS;
-var SPREADSHEET_ID = "13-2uFUBPUBSgDisDutP-rBjxEzI04ZfOz1njYvlVf7A";
-var SHEET_NAME = "Доп Гарантия";
+// ================= НАСТРОЙКИ =================
+const BOT_TOKEN = '8738738289:AAH0ft9j7k6xbf-o3yy_ZCmx0bitlzm8SLw'; // Замените на токен бота
+const SPREADSHEET_ID = '13-2uFUBPUBSgDisDutP-rBjxEzI04ZfOz1njYvlVf7A'; // ID основной таблицы (Гарантии и Заявки)
+const SHEET_NAME = 'Доп Гарантия'; 
+const REPAIR_SHEET_NAME = 'Заявки на обслуживание'; 
 
-// ✅ PERFORMANCE / BEHAVIOR
-var ROWS_CACHE_KEY = "warranty_rows_v2";
-var ROWS_CACHE_TTL_SECONDS = 60;
-var SESSION_TTL_SECONDS = 900; // 15 минут
-var UPDATE_DEDUP_TTL_SECONDS = 600;
-var REQUIRE_SERIAL = false; // true => включить шаг ask_serial
-var ADMIN_CHAT_ID = ""; // опционально: ID чата для логов ошибок
+// Настройки для магазина (отдельная таблица прайса)
+const SHOP_SPREADSHEET_ID = '14RHmpJ3rkW9N_xBu0zHN1sEuxFkUuU6_i_kgP2SSU1Q'; // ID вашей таблицы с товарами
+const SHOP_SHEET_NAME = 'Прайс'; // Название листа с товарами
 
-// ✅ FSM steps
-var STEP_ASK_DATE = "ask_date";
-var STEP_ASK_DATE_MANUAL = "ask_date_manual";
-var STEP_ASK_CATEGORY = "ask_category";
-var STEP_ASK_ITEM = "ask_item";
-var STEP_ASK_SERIAL = "ask_serial";
+const ADMIN_CHAT_ID = '5511276928'; // ID чата для уведомлений
 
-// =========================
-// Telegram API helpers
-// =========================
-function apiRequest(method, payload) {
-  return UrlFetchApp.fetch(TELEGRAM_URL + "/" + method, {
-    method: "post",
-    contentType: "application/json",
-    muteHttpExceptions: true,
-    payload: JSON.stringify(payload || {})
-  });
+// Кэш для FSM состояний и данных таблицы
+const cache = CacheService.getScriptCache();
+const CACHE_SHEET_KEY = 'guarantee_sheet_data';
+const CACHE_SHOP_KEY = 'shop_sheet_data';
+const LAST_UPDATE_KEY = 'last_update_id';
+const CACHE_TTL = 3600; // 1 час для магазина
+const SESSION_TTL = 900; // 15 минут на сессию
+
+// ================= FSM ОПИСАНИЕ =================
+const STATE = {
+  ASK_DATE: 'ask_date',
+  ASK_MODEL: 'ask_model',
+  ASK_SERIAL: 'ask_serial',
+  PROCESSING: 'processing',
+  
+  REPAIR_ASK_FIO: 'repair_ask_fio',
+  REPAIR_ASK_PHONE: 'repair_ask_phone',
+  REPAIR_ASK_MODEL: 'repair_ask_model',
+  REPAIR_ASK_SERIAL: 'repair_ask_serial',
+  REPAIR_ASK_DESC: 'repair_ask_desc',
+  REPAIR_PROCESSING: 'repair_processing',
+
+  SHOP_ASK_QUERY: 'shop_ask_query',
+  SHOP_PROCESSING: 'shop_processing'
+};
+
+function doGet(e) {
+  return ContentService.createTextOutput('OK').setMimeType(ContentService.MimeType.TEXT);
 }
 
-function sendMessage(chatId, text, replyMarkup) {
-  var payload = { chat_id: chatId, text: text };
-  if (replyMarkup) payload.reply_markup = replyMarkup;
-  try { apiRequest("sendMessage", payload); } catch (e) {}
-}
-
-function answerCallback(callbackQueryId) {
-  try { apiRequest("answerCallbackQuery", { callback_query_id: callbackQueryId }); } catch (e) {}
-}
-
-function sendStartMenu(chatId) {
-  sendMessage(chatId, "🔧 Выберите действие:", {
-    inline_keyboard: [[{ text: "✅ Подтвердить гарантию", callback_data: "confirm_service" }]]
-  });
-}
-
-// =========================
-// Logging
-// =========================
-function logEvent(type, message) {
-  var line = "🧾 LOG:\n" + type + ": " + message;
-  Logger.log(line);
-}
-
-function logError(error, context) {
-  var line = "ERROR: " + (context || "unknown") + " | " + (error && error.message ? error.message : error);
-  logEvent("ERROR", line);
-  if (ADMIN_CHAT_ID) {
-    sendMessage(ADMIN_CHAT_ID, "⚠️ " + line);
-  }
-}
-
-// =========================
-// Utils
-// =========================
-function normalize(str) { return String(str || "").trim().toLowerCase(); }
-function normalizeSerial(str) { return String(str || "").trim().toUpperCase(); }
-function isValidDateFormat(str) { return /^\d{4}-\d{2}-\d{2}$/.test(String(str || "")); }
-
-function normalizeDateToYmd(value) {
-  var timezone = Session.getScriptTimeZone();
-  if (value instanceof Date) return Utilities.formatDate(value, timezone, "yyyy-MM-dd");
-  var raw = String(value || "").trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-  if (/^\d{2}\.\d{2}\.\d{4}$/.test(raw)) return raw.split(".").reverse().join("-");
-  return raw;
-}
-
-function isConfirmed(row) {
-  var serial = String(row.serial || "").trim();
-  var statusRaw = String(row.status || "").trim().toLowerCase();
-  return !!serial || row.status === true || statusRaw === "true" || statusRaw === "confirmed";
-}
-
-function buildSessionKey(chatId, userId) {
-  return "session_" + chatId + "_" + userId;
-}
-
-function getSession(chatId, userId) {
-  var key = buildSessionKey(chatId, userId);
-  var cached = CacheService.getScriptCache().get(key);
-  if (!cached) return {};
-  try { return JSON.parse(cached); } catch (e) { return {}; }
-}
-
-function saveSession(chatId, userId, sessionData) {
-  CacheService.getScriptCache().put(
-    buildSessionKey(chatId, userId),
-    JSON.stringify(sessionData || {}),
-    SESSION_TTL_SECONDS
-  );
-}
-
-function clearSession(chatId, userId) {
-  CacheService.getScriptCache().remove(buildSessionKey(chatId, userId));
-}
-
-function invalidateRowsCache() {
-  CacheService.getScriptCache().remove(ROWS_CACHE_KEY);
-}
-
-// =========================
-// Sheets helpers
-// =========================
-function getSheet() {
-  var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
-  if (!sheet) throw new Error("Sheet not found: " + SHEET_NAME);
-  return sheet;
-}
-
-function getAllRows() {
-  var cache = CacheService.getScriptCache();
-  var cached = cache.get(ROWS_CACHE_KEY);
-  if (cached) {
-    try { return JSON.parse(cached); } catch (e) {}
-  }
-
-  var sheet = getSheet();
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
-
-  var values = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
-  var rows = [];
-  for (var i = 0; i < values.length; i++) {
-    rows.push({
-      rowNumber: i + 2,
-      date: normalizeDateToYmd(values[i][0]),
-      category: String(values[i][1] || "").trim(),
-      item: String(values[i][2] || "").trim(),
-      serial: String(values[i][3] || "").trim(),
-      status: values[i][4]
-    });
-  }
-
-  cache.put(ROWS_CACHE_KEY, JSON.stringify(rows), ROWS_CACHE_TTL_SECONDS);
-  return rows;
-}
-
-function getAvailableDates(rows) {
-  var map = {};
-  for (var i = 0; i < rows.length; i++) {
-    if (!isConfirmed(rows[i]) && rows[i].date) map[rows[i].date] = true;
-  }
-  var dates = Object.keys(map).sort().reverse();
-  return dates.slice(0, 7);
-}
-
-function getCategoriesByDate(rows, date) {
-  var map = {};
-  for (var i = 0; i < rows.length; i++) {
-    if (!isConfirmed(rows[i]) && rows[i].date === date && rows[i].category) {
-      map[rows[i].category] = true;
-    }
-  }
-  return Object.keys(map).sort();
-}
-
-function getItemsByDateCategory(rows, date, category) {
-  var items = [];
-  for (var i = 0; i < rows.length; i++) {
-    if (!isConfirmed(rows[i]) && rows[i].date === date && rows[i].category === category && rows[i].item) {
-      items.push({ rowNumber: rows[i].rowNumber, item: rows[i].item });
-    }
-  }
-  return items;
-}
-
-function encodeCategory(category) {
-  return encodeURIComponent(category);
-}
-
-function decodeCategory(value) {
-  try { return decodeURIComponent(value); } catch (e) { return ""; }
-}
-
-function confirmWarrantyByRow(rowNumber, serial) {
-  var lock = LockService.getDocumentLock();
-  if (!lock.tryLock(2000)) throw new Error("Lock timeout");
-
-  try {
-    var sheet = getSheet();
-    var row = sheet.getRange(rowNumber, 1, 1, 5).getValues()[0];
-    var current = {
-      date: normalizeDateToYmd(row[0]),
-      category: String(row[1] || "").trim(),
-      item: String(row[2] || "").trim(),
-      serial: String(row[3] || "").trim(),
-      status: row[4]
-    };
-
-    if (isConfirmed(current)) {
-      return { ok: false, reason: "already_confirmed" };
-    }
-
-    sheet.getRange(rowNumber, 4, 1, 2).setValues([[normalizeSerial(serial), true]]);
-    invalidateRowsCache();
-    return { ok: true };
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-// =========================
-// UX blocks
-// =========================
-function showDatePicker(chatId) {
-  var rows = getAllRows();
-  var dates = getAvailableDates(rows);
-  var buttons = [];
-
-  for (var i = 0; i < dates.length; i++) {
-    buttons.push([{ text: dates[i], callback_data: "date_" + dates[i] }]);
-  }
-  buttons.push([{ text: "✏️ Ввести вручную", callback_data: "manual_date" }]);
-
-  sendMessage(chatId, "📅 Выберите дату покупки:", { inline_keyboard: buttons });
-}
-
-function showCategories(chatId, date) {
-  var rows = getAllRows();
-  var categories = getCategoriesByDate(rows, date);
-
-  if (!categories.length) {
-    sendMessage(chatId, "❌ Заказы за эту дату не найдены");
-    sendStartMenu(chatId);
-    return false;
-  }
-
-  var buttons = [];
-  for (var i = 0; i < categories.length; i++) {
-    buttons.push([{
-      text: categories[i],
-      callback_data: "category_" + encodeCategory(categories[i])
-    }]);
-  }
-
-  sendMessage(chatId, "📦 Выберите категорию:", { inline_keyboard: buttons });
-  return true;
-}
-
-function showItems(chatId, date, category) {
-  var rows = getAllRows();
-  var items = getItemsByDateCategory(rows, date, category);
-
-  if (!items.length) {
-    sendMessage(chatId, "❌ Товары не найдены для выбранной категории");
-    sendStartMenu(chatId);
-    return false;
-  }
-
-  var buttons = [];
-  for (var i = 0; i < items.length; i++) {
-    buttons.push([{ text: items[i].item, callback_data: "item_" + items[i].rowNumber }]);
-  }
-
-  sendMessage(chatId, "📱 Выберите товар:", { inline_keyboard: buttons });
-  return true;
-}
-
-// =========================
-// Message handling
-// =========================
-function handleStart(chatId, userId) {
-  clearSession(chatId, userId);
-  sendStartMenu(chatId);
-}
-
-function handleManualDateInput(chatId, userId, text) {
-  if (!isValidDateFormat(text)) {
-    sendMessage(chatId, "❗ Неверный формат даты");
-    return;
-  }
-
-  var session = getSession(chatId, userId);
-  session.step = STEP_ASK_CATEGORY;
-  session.date = text;
-  saveSession(chatId, userId, session);
-
-  var ok = showCategories(chatId, text);
-  if (!ok) clearSession(chatId, userId);
-}
-
-function handleSerialInput(chatId, userId, text) {
-  var session = getSession(chatId, userId);
-  if (session.step !== STEP_ASK_SERIAL || !session.rowNumber) {
-    sendMessage(chatId, "Нажмите /start");
-    return;
-  }
-
-  var result = confirmWarrantyByRow(Number(session.rowNumber), text || "");
-  if (result.ok) {
-    sendMessage(chatId, "✅ Ваша гарантия подтверждена!");
-  } else {
-    sendMessage(chatId, "⚠️ Гарантия уже была подтверждена ранее");
-  }
-
-  clearSession(chatId, userId);
-  sendStartMenu(chatId);
-}
-
-function handleMessage(msg) {
-  var chatId = msg.chat.id;
-  var userId = msg.from.id;
-  var text = String(msg.text || "");
-  logEvent("MSG", text);
-
-  if (text === "/start") {
-    handleStart(chatId, userId);
-    return;
-  }
-
-  var session = getSession(chatId, userId);
-  if (session.step === STEP_ASK_DATE_MANUAL) {
-    handleManualDateInput(chatId, userId, text);
-    return;
-  }
-
-  if (session.step === STEP_ASK_SERIAL) {
-    handleSerialInput(chatId, userId, text);
-    return;
-  }
-
-  sendMessage(chatId, "Нажмите /start");
-}
-
-// =========================
-// Callback handling
-// =========================
-function handleDateSelected(chatId, userId, date) {
-  if (!isValidDateFormat(date)) {
-    sendMessage(chatId, "❗ Неверный формат даты");
-    return;
-  }
-
-  var session = getSession(chatId, userId);
-  session.step = STEP_ASK_CATEGORY;
-  session.date = date;
-  delete session.category;
-  delete session.rowNumber;
-  saveSession(chatId, userId, session);
-
-  var ok = showCategories(chatId, date);
-  if (!ok) clearSession(chatId, userId);
-}
-
-function handleCategorySelected(chatId, userId, encodedCategory) {
-  var session = getSession(chatId, userId);
-  if (session.step !== STEP_ASK_CATEGORY || !session.date) {
-    sendMessage(chatId, "Нажмите /start");
-    return;
-  }
-
-  var category = decodeCategory(encodedCategory);
-  if (!category) {
-    sendMessage(chatId, "⚠️ Некорректная категория");
-    return;
-  }
-
-  session.step = STEP_ASK_ITEM;
-  session.category = category;
-  delete session.rowNumber;
-  saveSession(chatId, userId, session);
-
-  var ok = showItems(chatId, session.date, category);
-  if (!ok) clearSession(chatId, userId);
-}
-
-function handleItemSelected(chatId, userId, rowNumberRaw) {
-  var session = getSession(chatId, userId);
-  if (session.step !== STEP_ASK_ITEM || !session.date || !session.category) {
-    sendMessage(chatId, "Нажмите /start");
-    return;
-  }
-
-  var rowNumber = Number(rowNumberRaw);
-  if (!rowNumber) {
-    sendMessage(chatId, "⚠️ Некорректный товар");
-    return;
-  }
-
-  var rows = getAllRows();
-  var found = null;
-  for (var i = 0; i < rows.length; i++) {
-    if (rows[i].rowNumber === rowNumber) {
-      found = rows[i];
-      break;
-    }
-  }
-
-  if (!found || isConfirmed(found) || found.date !== session.date || found.category !== session.category) {
-    sendMessage(chatId, "⚠️ Товар недоступен для подтверждения");
-    clearSession(chatId, userId);
-    sendStartMenu(chatId);
-    return;
-  }
-
-  if (REQUIRE_SERIAL) {
-    session.step = STEP_ASK_SERIAL;
-    session.rowNumber = rowNumber;
-    saveSession(chatId, userId, session);
-    sendMessage(chatId, "🔢 Введите серийный номер:");
-    return;
-  }
-
-  var result = confirmWarrantyByRow(rowNumber, "");
-  if (result.ok) {
-    sendMessage(chatId, "✅ Ваша гарантия подтверждена!");
-  } else {
-    sendMessage(chatId, "⚠️ Гарантия уже была подтверждена ранее");
-  }
-
-  clearSession(chatId, userId);
-  sendStartMenu(chatId);
-}
-
-function handleCallback(query) {
-  answerCallback(query.id); // максимально быстрый ACK
-
-  var chatId = query && query.message && query.message.chat ? query.message.chat.id : null;
-  var userId = query && query.from ? query.from.id : null;
-  var data = String(query.data || "");
-  if (!chatId || !userId) return;
-
-  logEvent("CALLBACK", data);
-
-  if (data === "confirm_service") {
-    saveSession(chatId, userId, { step: STEP_ASK_DATE });
-    showDatePicker(chatId);
-    return;
-  }
-
-  if (data === "manual_date") {
-    saveSession(chatId, userId, { step: STEP_ASK_DATE_MANUAL });
-    sendMessage(chatId, "✏️ Введите дату в формате YYYY-MM-DD");
-    return;
-  }
-
-  if (data.indexOf("date_") === 0) {
-    handleDateSelected(chatId, userId, data.replace("date_", ""));
-    return;
-  }
-
-  if (data.indexOf("category_") === 0) {
-    handleCategorySelected(chatId, userId, data.replace("category_", ""));
-    return;
-  }
-
-  if (data.indexOf("item_") === 0) {
-    handleItemSelected(chatId, userId, data.replace("item_", ""));
-  }
-}
-
-// =========================
-// Webhook entrypoint
-// =========================
-function isDuplicateUpdate(updateId) {
-  if (updateId === undefined || updateId === null) return false;
-  var key = "update_id_" + updateId;
-  var cache = CacheService.getScriptCache();
-  if (cache.get(key)) return true;
-  cache.put(key, "1", UPDATE_DEDUP_TTL_SECONDS);
-  return false;
-}
-
+// ================= ОСНОВНОЙ ВЕБХУК =================
 function doPost(e) {
   try {
-    var payload = JSON.parse(e.postData.contents || "{}");
-    if (isDuplicateUpdate(payload.update_id)) {
-      return ContentService.createTextOutput("ok");
+    if (!e || !e.postData) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
     }
 
-    if (payload.callback_query) {
-      handleCallback(payload.callback_query);
-    } else if (payload.message) {
-      handleMessage(payload.message);
+    const contents = JSON.parse(e.postData.contents);
+    const updateId = contents.update_id;
+    const lastUpdateId = cache.get(LAST_UPDATE_KEY);
+    
+    if (lastUpdateId && parseInt(lastUpdateId) >= updateId) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
     }
+    
+    cache.put(LAST_UPDATE_KEY, updateId.toString(), 3600);
+
+    if (contents.callback_query) handleCallback(contents.callback_query);
+    if (contents.message) handleMessage(contents.message);
+
+    return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
+
   } catch (err) {
-    logError(err, "doPost");
-    try {
-      if (e && e.postData && e.postData.contents) {
-        var fallback = JSON.parse(e.postData.contents);
-        var chatId = fallback && fallback.message && fallback.message.chat ? fallback.message.chat.id : null;
-        if (chatId) sendMessage(chatId, "⚠️ Произошла ошибка. Попробуйте позже.");
-      }
-    } catch (nested) {
-      logError(nested, "doPost_fallback");
-    }
+    console.error(`doPost error: ${err.toString()}`);
+    return ContentService.createTextOutput(JSON.stringify({ error: err.toString() })).setMimeType(ContentService.MimeType.JSON);
   }
-
-  return ContentService.createTextOutput("ok");
 }
 
+// ================= ОБРАБОТКА КНОПОК =================
+function handleCallback(query) {
+  const chatId = query.message.chat.id.toString();
+  const data = query.data;
 
-function pollTelegram() {
-  var url = TELEGRAM_URL + "/getUpdates";
-  var response = UrlFetchApp.fetch(url);
-  var data = JSON.parse(response.getContentText());
+  if (data === 'menu_store') {
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '🔍 Уточнить наличие и цену', callback_data: 'store_check_price' }],
+        [{ text: '⬅️ Назад', callback_data: 'back_to_main' }]
+      ]
+    };
+    sendMessage(chatId, '🛒 *Магазин*\n\nВыберите нужное действие:', keyboard);
+    
+  } else if (data === 'menu_service') {
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '✅ Подтвердить гарантию', callback_data: 'confirm_start' }],
+        [{ text: '🔧 Заявка на гарантийное обслуживание', callback_data: 'repair_start' }],
+        [{ text: '⬅️ Назад', callback_data: 'back_to_main' }]
+      ]
+    };
+    sendMessage(chatId, '🔧 *Гарантийный сервис*\n\nВыберите нужное действие:', keyboard);
+    
+  } else if (data === 'store_check_price') {
+    setState(chatId, { state: STATE.SHOP_ASK_QUERY, data: {} });
+    sendMessage(chatId, '🔍 *Поиск товара*\n\nВведите *наименование товара* или *код товара* с Онлайнера:');
+    
+  } else if (data === 'back_to_main') {
+    showMainMenu(chatId);
+    
+  } else if (data === 'confirm_start') {
+    setState(chatId, { state: STATE.ASK_DATE, data: {} });
+    sendMessage(chatId,
+      '🛡 *Подтверждение гарантии*\n\n📌 Обратите внимание:\nГарантию можно подтвердить в течение *14 дней* с момента покупки.\n\n🙏 Спасибо, что выбрали нас!\n\n📅 Введите дату покупки в формате:\n*DD.MM.YYYY*\n\nПример: *15.04.2024*'
+    );
+  } else if (data === 'repair_start') {
+    setState(chatId, { state: STATE.REPAIR_ASK_FIO, data: {} });
+    sendMessage(chatId, '🔧 *Заявка на гарантийное обслуживание*\n\nПожалуйста, заполните данные о поломке.\n\n👤 Введите ваши *ФИО*:');
+  }
+}
 
-  if (!data.result || !data.result.length) return;
+function showMainMenu(chatId) {
+  clearState(chatId);
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '🛒 Магазин', callback_data: 'menu_store' }],
+      [{ text: '🔧 Сервис', callback_data: 'menu_service' }]
+    ]
+  };
+  sendMessage(chatId, '👋 *Добро пожаловать!*\n\nВыберите раздел:', keyboard);
+}
 
-  for (var i = 0; i < data.result.length; i++) {
-    var update = data.result[i];
+// ================= ОБРАБОТЧИК СООБЩЕНИЙ =================
+function handleMessage(msg) {
+  const chatId = msg.chat.id.toString();
+  const text = msg.text ? msg.text.trim() : '';
+  const userId = msg.from.id.toString();
+  
+  if (!text) return;
+  console.log(`USER: ${userId} | CHAT: ${chatId} | MSG: ${text}`);
 
-    if (isDuplicateUpdate(update.update_id)) continue;
+  if (text === '/start') {
+    showMainMenu(chatId);
+    return;
+  }
 
-    try {
-      if (update.callback_query) {
-        handleCallback(update.callback_query);
-      } else if (update.message) {
-        handleMessage(update.message);
+  const userState = getState(chatId);
+  if (!userState || !userState.state) {
+    sendMessage(chatId, 'Пожалуйста, начните с команды /start');
+    return;
+  }
+
+  const currentState = userState.state;
+  const sessionData = userState.data || {};
+
+  // ================= ЛОГИКА МАГАЗИНА =================
+  if (currentState === STATE.SHOP_ASK_QUERY) {
+    if (text.length < 2) {
+      sendMessage(chatId, '❗ Запрос слишком короткий. Введите название или код товара.');
+      return;
+    }
+    setState(chatId, { state: STATE.SHOP_PROCESSING, data: sessionData });
+    sendMessage(chatId, '⏳ Ищу товар...');
+    processShopSearch(chatId, text);
+    return;
+  }
+
+  if (currentState === STATE.SHOP_PROCESSING) {
+    sendMessage(chatId, '⚠️ Подождите, поиск еще не завершен.');
+    return;
+  }
+
+  // ================= ЛОГИКА ГАРАНТИИ =================
+  if (currentState === STATE.ASK_DATE) {
+    const dateRegex = /^\d{2}\.\d{2}\.\d{4}$/;
+    if (!dateRegex.test(text)) {
+      sendMessage(chatId, '❗ Неверный формат даты\nВведите дату в формате *DD.MM.YYYY*\n\nПример: *15.04.2024*');
+      return;
+    }
+    const parts = text.split('.');
+    const inputDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
+    const date = new Date(inputDate);
+    if (isNaN(date.getTime())) {
+      sendMessage(chatId, '❗ Такой даты не существует\nВведите дату в формате *DD.MM.YYYY*');
+      return;
+    }
+    const purchaseDate = new Date(inputDate);
+    const now = new Date();
+    const diffDays = Math.floor((now - purchaseDate) / (1000 * 60 * 60 * 24));
+    if (diffDays > 14) {
+      sendMessage(chatId, '⚠️ *Срок подтверждения гарантии истёк*\n\nПодтверждение возможно в течение *14 дней* после покупки.\n\n📅 Прошло дней: *' + diffDays + '*\n📆 Дата покупки: *' + text + '*\n\nК сожалению, гарантия больше не может быть активирована.');
+      clearState(chatId);
+      return;
+    }
+    sessionData.date = inputDate;
+    setState(chatId, { state: STATE.ASK_MODEL, data: sessionData });
+    sendMessage(chatId, '📦 Введите точную модель товара:');
+    return;
+  }
+
+  if (currentState === STATE.ASK_MODEL) {
+    if (text.length < 2) { sendMessage(chatId, '❗ Название модели слишком короткое.'); return; }
+    sessionData.model = text;
+    setState(chatId, { state: STATE.ASK_SERIAL, data: sessionData });
+    sendMessage(chatId, '🔢 *Введите серийный номер устройства*\n\n📍 Где его найти:\n• на корпусе устройства\n• на упаковке (коробке)\n• в гарантийном талоне\n\n✍️ Введите номер точно, как указано');
+    return;
+  }
+
+  if (currentState === STATE.ASK_SERIAL) {
+    if (text.length < 3) { sendMessage(chatId, '❗ Серийный номер слишком короткий.'); return; }
+    sessionData.serial = text.trim();
+    setState(chatId, { state: STATE.PROCESSING, data: sessionData });
+    sendMessage(chatId, '⏳ Проверяю данные...');
+    processGuarantee(chatId, sessionData.date, sessionData.model, sessionData.serial);
+    return;
+  }
+
+  if (currentState === STATE.PROCESSING) { sendMessage(chatId, '⚠️ Подождите, идёт проверка предыдущего запроса.'); return; }
+
+  // ================= ЛОГИКА ЗАЯВКИ НА ОБСЛУЖИВАНИЕ =================
+  if (currentState === STATE.REPAIR_ASK_FIO) {
+    if (text.length < 3) { sendMessage(chatId, '❗ ФИО слишком короткое. Введите полностью.'); return; }
+    sessionData.fio = text;
+    setState(chatId, { state: STATE.REPAIR_ASK_PHONE, data: sessionData });
+    sendMessage(chatId, '📱 Введите ваш *номер телефона*:\n\nПример: +37529xxxxxxx');
+    return;
+  }
+
+  if (currentState === STATE.REPAIR_ASK_PHONE) {
+    const cleanPhone = text.replace(/[^0-9+]/g, '');
+    if (cleanPhone.length < 13) { sendMessage(chatId, '❗ Номер телефона выглядит некорректно.\nВведите номер в формате: +37529xxxxxxx'); return; }
+    sessionData.phone = cleanPhone;
+    setState(chatId, { state: STATE.REPAIR_ASK_MODEL, data: sessionData });
+    sendMessage(chatId, '📦 Введите *наименование модели* устройства, которое сломалось:');
+    return;
+  }
+
+  if (currentState === STATE.REPAIR_ASK_MODEL) {
+    if (text.length < 2) { sendMessage(chatId, '❗ Название модели слишком короткое.'); return; }
+    sessionData.model = text;
+    setState(chatId, { state: STATE.REPAIR_ASK_SERIAL, data: sessionData });
+    sendMessage(chatId, '🔢 Введите *серийный номер* устройства:');
+    return;
+  }
+
+  if (currentState === STATE.REPAIR_ASK_SERIAL) {
+    if (text.length < 3) { sendMessage(chatId, '❗ Серийный номер слишком короткий.'); return; }
+    sessionData.serial = text.trim();
+    setState(chatId, { state: STATE.REPAIR_ASK_DESC, data: sessionData });
+    sendMessage(chatId, '📝 *Опишите проблему*\n\nПостарайтесь максимально подробно рассказать:\n• что произошло\n• при каких обстоятельствах\n• какие ошибки отображаются на экране (если есть)');
+    return;
+  }
+
+  if (currentState === STATE.REPAIR_ASK_DESC) {
+    if (text.length < 5) { sendMessage(chatId, '❗ Описание слишком короткое. Пожалуйста, опишите проблему подробнее (минимум 10 символов).'); return; }
+    sessionData.description = text;
+    setState(chatId, { state: STATE.REPAIR_PROCESSING, data: sessionData });
+    sendMessage(chatId, '⏳ Отправляю вашу заявку...');
+    processRepairRequest(chatId, sessionData);
+    return;
+  }
+
+  if (currentState === STATE.REPAIR_PROCESSING) { sendMessage(chatId, '⚠️ Подождите, заявка еще отправляется.'); return; }
+
+  sendMessage(chatId, 'Используйте /start для начала работы.');
+}
+
+// ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
+function formatDate(date) {
+  if (!date) return '';
+  const d = new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function formatCurrentDate() { return formatDate(new Date()); }
+
+function normalize(str) { return str.toLowerCase().replace(/\s+/g, ' ').trim(); }
+
+function normalizeSerial(str) { return str.replace(/\s+/g, '').toUpperCase(); }
+
+function formatPrice(price) {
+  const num = parseFloat(price);
+  if (isNaN(num)) return "Цена не указана";
+  const rubles = Math.floor(num);
+  const kopecks = Math.round((num - rubles) * 100);
+  const formattedRubles = rubles.toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+  return `${formattedRubles}.${kopecks.toString().padStart(2, '0')}`;
+}
+
+// ================= ЛОГИКА ПОИСКА В МАГАЗИНЕ (ОПТИМИЗАЦИЯ ПОД 50К+ СТРОК) =================
+function processShopSearch(chatId, query) {
+  try {
+    const sheet = SpreadsheetApp.openById(SHOP_SPREADSHEET_ID).getSheetByName(SHOP_SHEET_NAME);
+    if (!sheet) throw new Error('Лист "' + SHOP_SHEET_NAME + '" не найден!');
+
+    const cleanQuery = query.trim().toLowerCase();
+    const isNumericQuery = /^\d+$/.test(cleanQuery);
+
+    // 1. Читаем ТОЛЬКО заголовки (1 строка), чтобы найти номера столбцов
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const colMap = {};
+    headers.forEach(function(h, i) {
+      if(h) {
+        colMap[h.toString().toLowerCase().trim()] = i + 1; // +1 т.к. getColumn() считает с 1
       }
-    } catch (e) {
-      logError(e, "pollTelegram");
+    });
+
+    const colModel = colMap['model'] || 0;
+    const colPrice = colMap['price'] || 0;
+    const colPriceBn = colMap['price_bn'] || 0;
+    const colDelivery = colMap['delivery_day'] || 0;
+    const colId = colMap['onliner_id'] || 0;
+    const colUrl = colMap['onliner_url'] || 0;
+
+    if (!colModel || !colPrice) {
+      throw new Error('Не найдены столбцы model или price');
     }
 
-    // подтверждаем получение
-    UrlFetchApp.fetch(TELEGRAM_URL + "/getUpdates?offset=" + (update.update_id + 1));
+    let foundRows = [];
+
+    if (isNumericQuery) {
+      // ПОИСК ПО ЦИФРАМ (onliner_id)
+      const textFinder = sheet.createTextFinder(cleanQuery);
+      textFinder.findAll().forEach(function(cell) {
+        if (foundRows.length >= 10) return;
+        if (cell.getColumn() === colId) {
+          foundRows.push(cell.getRow());
+        }
+      });
+    } else {
+      // ПОИСК ПО ТЕКСТУ (model)
+      const textFinder = sheet.createTextFinder(cleanQuery).matchCase(false);
+      textFinder.findAll().forEach(function(cell) {
+        if (foundRows.length >= 10) return;
+        if (cell.getColumn() === colModel) {
+          if (foundRows.indexOf(cell.getRow()) === -1) { // Защита от дубликатов
+            foundRows.push(cell.getRow());
+          }
+        }
+      });
+    }
+
+    if (foundRows.length === 0) {
+      // Кнопка "Назад" даже если ничего не найдено
+      const errorKeyboard = {
+        inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'menu_store' }]]
+      };
+      sendMessage(chatId, 
+        '❌ *Товары не найдены*\n\nПроверьте правильность написания или попробуйте другой запрос.', 
+        errorKeyboard
+      );
+      clearState(chatId);
+      return;
+    }
+
+    // 2. Собираем данные ТОЛЬКО из найденных строк
+    let responseText = '🔍 *Найдено товаров: ' + foundRows.length + '*\n\n';
+    
+    foundRows.forEach(function(rowNum) {
+      const getVal = function(col) {
+        if (!col) return '';
+        try {
+          const val = sheet.getRange(rowNum, col).getValue();
+          if (!val || val.toString() === '#N/A') return '';
+          return val.toString().trim();
+        } catch(e) { return ''; }
+      };
+
+      const model = getVal(colModel);
+      let price = getVal(colPrice) || '0';
+      const priceBn = getVal(colPriceBn) || '0';
+      const delivery = getVal(colDelivery);
+      const url = getVal(colUrl);
+
+      // Если базовая цена 0, берем цену БН
+      if (price === '0') price = priceBn;
+
+      // УМНОЖАЕМ ЦЕНУ НА 3 И ФОРМАТИРУЕМ
+      const numPrice = parseFloat(price) * 3;
+      const formattedPrice = formatPrice(numPrice);
+
+      // Формируем строку доставки
+      let deliveryText = 'Сроки доставки: уточняйте';
+      if (delivery) {
+        deliveryText = '🚚 Сроки доставки (РБ +1 день): ' + delivery + ' дня';
+      }
+
+      const urlBlock = url ? '🔗 [Ссылка на Онлайнер](' + url + ')' : '⚠️ Ссылка на Онлайнер отсутствует';
+
+      responseText += 
+        '📦 *' + model + '*\n' +
+        '💰 ' + formattedPrice + ' руб.\n' +
+        deliveryText + '\n' +
+        urlBlock + '\n\n';
+    });
+
+    if (foundRows.length === 10) {
+       responseText += '_Показаны первые 10 результатов. Уточните запрос для более точного поиска._\n\n';
+    }
+
+    responseText += '💡 Для оформления заказа напишите менеджеру:\n📩 https://t.me/infotufby';
+
+    // Добавляем кнопку "Назад" к успешному результату
+    const successKeyboard = {
+      inline_keyboard: [[{ text: '🔍 Новый поиск', callback_data: 'store_check_price' }, { text: '⬅️ Назад', callback_data: 'menu_store' }]]
+    };
+
+    sendMessage(chatId, responseText, successKeyboard);
+    clearState(chatId);
+
+  } catch (error) {
+    console.error('ERROR in processShopSearch: ' + error.toString());
+    sendMessage(chatId, '⚠️ Произошла ошибка при поиске товара. Попробуйте позже.');
+    clearState(chatId);
+  }
+}
+
+// ================= ЛОГИКА ЗАЯВКИ НА РЕМОНТ =================
+function processRepairRequest(chatId, data) {
+  try {
+    const lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(5000);
+      const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(REPAIR_SHEET_NAME);
+      if (!sheet) throw new Error(`Лист "${REPAIR_SHEET_NAME}" не найден!`);
+
+      sheet.appendRow([formatCurrentDate(), data.fio, "'" + data.phone, data.model, data.serial, data.description]);
+      sendNotification(data);
+
+      sendMessage(chatId,
+        `✅ *Заявка на обслуживание успешно создана!*\n\n` +
+        `📋 *Данные заявки:*\n👤 Клиент: *${data.fio}*\n📞 Телефон: *${data.phone}*\n📦 Модель: *${data.model}*\n🔢 Серийный номер: *${data.serial}*\n💬 Проблема: _${data.description}_\n\n` +
+        `📌 Наш специалист свяжется с вами в ближайшее время для уточнения деталей.\n\nПо всем вопросам пишите https://t.me/infotufby 📩`
+      );
+    } catch (lockError) {
+      console.error(`Lock error: ${lockError.toString()}`);
+      sendMessage(chatId, '⚠️ Система временно занята. Пожалуйста, попробуйте через минуту.');
+    } finally {
+      lock.releaseLock();
+    }
+    clearState(chatId);
+  } catch (error) {
+    console.error(`ERROR in processRepairRequest: ${error.toString()}`);
+    sendMessage(chatId, '⚠️ Произошла ошибка при сохранении заявки. Попробуйте позже.');
+    clearState(chatId);
+  }
+}
+
+function sendNotification(data) {
+  try {
+    sendMessage(ADMIN_CHAT_ID, 
+      `🚨 *У вас новая заявка на гарантийное обслуживание!*\n\n👤 *Клиент:* ${data.fio}\n📞 *Телефон:* ${data.phone}\n📦 *Модель:* ${data.model}\n🔢 *Серийный номер:* ${data.serial}\n💬 *Проблема:* _${data.description}_`
+    );
+  } catch (e) {
+    console.error(`Failed to send admin notification: ${e.toString()}`);
+  }
+}
+
+// ================= ЛОГИКА ПРОВЕРКИ ГАРАНТИИ =================
+function processGuarantee(chatId, inputDate, inputModel, inputSerial) {
+  try {
+    let sheetData = cache.get(CACHE_SHEET_KEY);
+    let dataRows;
+    
+    if (sheetData) {
+      dataRows = JSON.parse(sheetData);
+    } else {
+      const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+      if (!sheet) throw new Error('Sheet not found');
+      const range = sheet.getDataRange();
+      const values = range.getValues();
+      
+      if (values.length <= 1) { dataRows = []; } 
+      else {
+        dataRows = values.slice(1).map((row, i) => ({
+          date: formatDate(row[0]), model: normalize(row[1]), serial: row[2] ? normalizeSerial(row[2].toString()) : '', status: row[3] ? row[3].toString().trim() : '', rowNumber: i + 2 
+        }));
+      }
+      cache.put(CACHE_SHEET_KEY, JSON.stringify(dataRows), 60);
+    }
+
+    const cleanModel = normalize(inputModel);
+    const cleanSerial = normalizeSerial(inputSerial);
+    
+    for (let row of dataRows) {
+      if (row.serial === cleanSerial && row.status === 'CONFIRMED') {
+        sendMessage(chatId, '⚠️ *Этот серийный номер уже зарегистрирован*\n\nКаждое устройство можно зарегистрировать только один раз.\n\nЕсли вы считаете, что это ошибка, обратитесь в поддержку.');
+        clearState(chatId); return;
+      }
+    }
+    
+    let foundRow = null;
+    for (let row of dataRows) {
+      if (row.date === inputDate && row.model === cleanModel && (row.serial === cleanSerial || row.serial === '' || !row.serial)) {
+        foundRow = row; break;
+      }
+    }
+
+    if (!foundRow) {
+      sendMessage(chatId, `❌ *Товар не найден*\n\n📌 Проверьте:\n• дату покупки\n• точное название модели\n• серийный номер\n\n🔄 Попробуйте снова: /start`);
+      clearState(chatId); return;
+    }
+
+    if (foundRow.status === 'CONFIRMED') {
+      sendMessage(chatId, '⚠️ Гарантия уже была подтверждена ранее');
+      clearState(chatId); return;
+    }
+
+    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+    const lock = LockService.getScriptLock();
+    
+    try {
+      lock.waitLock(5000); 
+      if (!foundRow.serial || foundRow.serial === '') sheet.getRange(foundRow.rowNumber, 3).setValue(cleanSerial);
+      sheet.getRange(foundRow.rowNumber, 4).setValue('CONFIRMED');
+      cache.remove(CACHE_SHEET_KEY);
+      
+      const formattedDate = inputDate.split('-').reverse().join('.');
+      sendMessage(chatId, `✅ *Гарантия успешно подтверждена!*\n\n🎉 Спасибо за покупку и доверие!\n\n📦 Модель: *${inputModel}*\n🔢 Серийный номер: *${inputSerial}*\n📅 Дата покупки: *${formattedDate}*\n\n📌 Ваше устройство теперь находится на гарантии.\n\nПо всем вопросам пишите https://t.me/infotufby 📩`);
+    } catch (lockError) {
+      console.error(`Lock error: ${lockError.toString()}`);
+      sendMessage(chatId, '⚠️ Система временно занята. Пожалуйста, попробуйте через минуту.');
+    } finally {
+      lock.releaseLock();
+    }
+    clearState(chatId);
+  } catch (error) {
+    console.error(`ERROR in processGuarantee: ${error.toString()}`);
+    sendMessage(chatId, '⚠️ Произошла ошибка при обращении к базе данных. Попробуйте позже.');
+    clearState(chatId);
+  }
+}
+
+// ================= РАБОТА СО СОСТОЯНИЯМИ И ОТПРАВКА =================
+function getState(chatId) {
+  const data = cache.get(`session_${chatId}`);
+  return data ? JSON.parse(data) : null;
+}
+
+function setState(chatId, stateData) {
+  stateData.updated_at = new Date().toISOString();
+  cache.put(`session_${chatId}`, JSON.stringify(stateData), SESSION_TTL);
+}
+
+function clearState(chatId) { cache.remove(`session_${chatId}`); }
+
+function sendMessage(chatId, text, keyboard = null) {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  const payload = { chat_id: chatId, text: text, parse_mode: 'Markdown', disable_web_page_preview: false };
+  if (keyboard) payload.reply_markup = keyboard;
+  
+  try {
+    UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true });
+  } catch (e) {
+    console.error(`ERROR sending message: ${e}`);
   }
 }
