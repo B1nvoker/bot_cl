@@ -304,14 +304,26 @@ function processShopSearch(chatId, query) {
     const cleanQuery = query.trim().toLowerCase();
     const isNumericQuery = /^\d+$/.test(cleanQuery);
 
-    // 1. Читаем ТОЛЬКО заголовки (1 строка), чтобы найти номера столбцов
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const colMap = {};
-    headers.forEach(function(h, i) {
-      if(h) {
-        colMap[h.toString().toLowerCase().trim()] = i + 1; // +1 т.к. getColumn() считает с 1
-      }
-    });
+    // Кэширование структуры каталога
+    let colMap = null;
+    let lastColumn = null;
+    const cachedShopStructure = cache.get(CACHE_SHOP_KEY);
+
+    if (cachedShopStructure) {
+      const parsed = JSON.parse(cachedShopStructure);
+      colMap = parsed.colMap;
+      lastColumn = parsed.lastColumn;
+    } else {
+      lastColumn = sheet.getLastColumn();
+      const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+      colMap = {};
+      headers.forEach(function(h, i) {
+        if(h) {
+          colMap[h.toString().toLowerCase().trim()] = i + 1; // +1 т.к. getColumn() считает с 1
+        }
+      });
+      cache.put(CACHE_SHOP_KEY, JSON.stringify({colMap, lastColumn}), CACHE_TTL);
+    }
 
     const colModel = colMap['model'] || 0;
     const colPrice = colMap['price'] || 0;
@@ -365,13 +377,14 @@ function processShopSearch(chatId, query) {
     let responseText = '🔍 *Найдено товаров: ' + foundRows.length + '*\n\n';
     
     foundRows.forEach(function(rowNum) {
+      // ОПТИМИЗАЦИЯ ЧТЕНИЯ: читаем всю строку сразу
+      const rowData = sheet.getRange(rowNum, 1, 1, lastColumn).getValues()[0];
+
       const getVal = function(col) {
-        if (!col) return '';
-        try {
-          const val = sheet.getRange(rowNum, col).getValue();
-          if (!val || val.toString() === '#N/A') return '';
-          return val.toString().trim();
-        } catch(e) { return ''; }
+        if (!col || col < 1 || col > lastColumn) return '';
+        const val = rowData[col - 1]; // Индекс массива начинается с 0, а колонка с 1
+        if (val === undefined || val === null || val.toString() === '#N/A') return '';
+        return val.toString().trim();
       };
 
       const model = getVal(colModel);
@@ -519,9 +532,12 @@ function processGuarantee(chatId, inputDate, inputModel, inputSerial) {
     
     try {
       lock.waitLock(5000); 
-      if (!foundRow.serial || foundRow.serial === '') sheet.getRange(foundRow.rowNumber, 3).setValue(cleanSerial);
-      sheet.getRange(foundRow.rowNumber, 4).setValue('CONFIRMED');
-      cache.remove(CACHE_SHEET_KEY);
+      try {
+        if (!foundRow.serial || foundRow.serial === '') sheet.getRange(foundRow.rowNumber, 3).setValue(cleanSerial);
+        sheet.getRange(foundRow.rowNumber, 4).setValue('CONFIRMED');
+      } finally {
+        cache.remove(CACHE_SHEET_KEY);
+      }
       
       const formattedDate = inputDate.split('-').reverse().join('.');
       sendMessage(chatId, `✅ *Гарантия успешно подтверждена!*\n\n🎉 Спасибо за покупку и доверие!\n\n📦 Модель: *${escapeMarkdown(inputModel)}*\n🔢 Серийный номер: *${escapeMarkdown(inputSerial)}*\n📅 Дата покупки: *${escapeMarkdown(formattedDate)}*\n\n📌 Ваше устройство теперь находится на гарантии.\n\nПо всем вопросам пишите https://t.me/infotufby 📩`);
