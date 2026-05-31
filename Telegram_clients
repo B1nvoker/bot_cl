@@ -1,14 +1,26 @@
 // ================= НАСТРОЙКИ =================
-const BOT_TOKEN = '8738738289:AAH0ft9j7k6xbf-o3yy_ZCmx0bitlzm8SLw'; // Замените на токен бота
-const SPREADSHEET_ID = '13-2uFUBPUBSgDisDutP-rBjxEzI04ZfOz1njYvlVf7A'; // ID основной таблицы (Гарантии и Заявки)
+function setupProperties() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    'BOT_TOKEN': 'YOUR_BOT_TOKEN_HERE',
+    'SPREADSHEET_ID': 'YOUR_MAIN_SPREADSHEET_ID_HERE',
+    'SHOP_SPREADSHEET_ID': 'YOUR_SHOP_SPREADSHEET_ID_HERE',
+    'ADMIN_CHAT_ID': 'YOUR_ADMIN_CHAT_ID_HERE'
+  });
+}
+
+const BOT_TOKEN = PropertiesService.getScriptProperties().getProperty('BOT_TOKEN');
+const SPREADSHEET_ID = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
 const SHEET_NAME = 'Доп Гарантия'; 
 const REPAIR_SHEET_NAME = 'Заявки на обслуживание'; 
 
 // Настройки для магазина (отдельная таблица прайса)
-const SHOP_SPREADSHEET_ID = '14RHmpJ3rkW9N_xBu0zHN1sEuxFkUuU6_i_kgP2SSU1Q'; // ID вашей таблицы с товарами
+const SHOP_SPREADSHEET_ID = PropertiesService.getScriptProperties().getProperty('SHOP_SPREADSHEET_ID');
 const SHOP_SHEET_NAME = 'Прайс'; // Название листа с товарами
 
-const ADMIN_CHAT_ID = '5511276928'; // ID чата для уведомлений
+// Add robust ID validation by safely casting to string and stripping spaces
+const _RAW_ADMIN_CHAT_ID = PropertiesService.getScriptProperties().getProperty('ADMIN_CHAT_ID');
+const ADMIN_CHAT_ID = _RAW_ADMIN_CHAT_ID ? String(_RAW_ADMIN_CHAT_ID).replace(/\s+/g, '') : null;
 
 // Кэш для FSM состояний и данных таблицы
 const cache = CacheService.getScriptCache();
@@ -257,6 +269,11 @@ function handleMessage(msg) {
 }
 
 // ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
+function escapeMarkdown(text) {
+  if (!text) return '';
+  return String(text).replace(/([_*\[\]`])/g, '\\$1');
+}
+
 function formatDate(date) {
   if (!date) return '';
   const d = new Date(date);
@@ -379,7 +396,7 @@ function processShopSearch(chatId, query) {
       const urlBlock = url ? '🔗 [Ссылка на Онлайнер](' + url + ')' : '⚠️ Ссылка на Онлайнер отсутствует';
 
       responseText += 
-        '📦 *' + model + '*\n' +
+        '📦 *' + escapeMarkdown(model) + '*\n' +
         '💰 ' + formattedPrice + ' руб.\n' +
         deliveryText + '\n' +
         urlBlock + '\n\n';
@@ -420,7 +437,7 @@ function processRepairRequest(chatId, data) {
 
       sendMessage(chatId,
         `✅ *Заявка на обслуживание успешно создана!*\n\n` +
-        `📋 *Данные заявки:*\n👤 Клиент: *${data.fio}*\n📞 Телефон: *${data.phone}*\n📦 Модель: *${data.model}*\n🔢 Серийный номер: *${data.serial}*\n💬 Проблема: _${data.description}_\n\n` +
+        `📋 *Данные заявки:*\n👤 Клиент: *${escapeMarkdown(data.fio)}*\n📞 Телефон: *${escapeMarkdown(data.phone)}*\n📦 Модель: *${escapeMarkdown(data.model)}*\n🔢 Серийный номер: *${escapeMarkdown(data.serial)}*\n💬 Проблема: _${escapeMarkdown(data.description)}_\n\n` +
         `📌 Наш специалист свяжется с вами в ближайшее время для уточнения деталей.\n\nПо всем вопросам пишите https://t.me/infotufby 📩`
       );
     } catch (lockError) {
@@ -440,7 +457,7 @@ function processRepairRequest(chatId, data) {
 function sendNotification(data) {
   try {
     sendMessage(ADMIN_CHAT_ID, 
-      `🚨 *У вас новая заявка на гарантийное обслуживание!*\n\n👤 *Клиент:* ${data.fio}\n📞 *Телефон:* ${data.phone}\n📦 *Модель:* ${data.model}\n🔢 *Серийный номер:* ${data.serial}\n💬 *Проблема:* _${data.description}_`
+      `🚨 *У вас новая заявка на гарантийное обслуживание!*\n\n👤 *Клиент:* ${escapeMarkdown(data.fio)}\n📞 *Телефон:* ${escapeMarkdown(data.phone)}\n📦 *Модель:* ${escapeMarkdown(data.model)}\n🔢 *Серийный номер:* ${escapeMarkdown(data.serial)}\n💬 *Проблема:* _${escapeMarkdown(data.description)}_`
     );
   } catch (e) {
     console.error(`Failed to send admin notification: ${e.toString()}`);
@@ -507,7 +524,7 @@ function processGuarantee(chatId, inputDate, inputModel, inputSerial) {
       cache.remove(CACHE_SHEET_KEY);
       
       const formattedDate = inputDate.split('-').reverse().join('.');
-      sendMessage(chatId, `✅ *Гарантия успешно подтверждена!*\n\n🎉 Спасибо за покупку и доверие!\n\n📦 Модель: *${inputModel}*\n🔢 Серийный номер: *${inputSerial}*\n📅 Дата покупки: *${formattedDate}*\n\n📌 Ваше устройство теперь находится на гарантии.\n\nПо всем вопросам пишите https://t.me/infotufby 📩`);
+      sendMessage(chatId, `✅ *Гарантия успешно подтверждена!*\n\n🎉 Спасибо за покупку и доверие!\n\n📦 Модель: *${escapeMarkdown(inputModel)}*\n🔢 Серийный номер: *${escapeMarkdown(inputSerial)}*\n📅 Дата покупки: *${escapeMarkdown(formattedDate)}*\n\n📌 Ваше устройство теперь находится на гарантии.\n\nПо всем вопросам пишите https://t.me/infotufby 📩`);
     } catch (lockError) {
       console.error(`Lock error: ${lockError.toString()}`);
       sendMessage(chatId, '⚠️ Система временно занята. Пожалуйста, попробуйте через минуту.');
