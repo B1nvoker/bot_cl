@@ -181,15 +181,26 @@ function handleMessage(msg) {
       return;
     }
     const parts = text.split('.');
-    const inputDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
-    const date = new Date(inputDate);
-    if (isNaN(date.getTime())) {
+    const day = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1;
+    const year = parseInt(parts[2], 10);
+
+    const date = new Date(year, month, day);
+    if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day) {
       sendMessage(chatId, '❗ Такой даты не существует\nВведите дату в формате *DD.MM.YYYY*');
       return;
     }
-    const purchaseDate = new Date(inputDate);
+
+    const inputDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
+    const purchaseDate = new Date(year, month, day);
+
     const now = new Date();
-    const diffDays = Math.floor((now - purchaseDate) / (1000 * 60 * 60 * 24));
+    // Use Minsk timezone (UTC+3) to ensure days align correctly with user local time
+    const minskNow = new Date(now.getTime() + (3 * 60 * 60 * 1000));
+    const minskTodayMidnight = new Date(Date.UTC(minskNow.getUTCFullYear(), minskNow.getUTCMonth(), minskNow.getUTCDate()));
+    const purchaseDateMidnight = new Date(Date.UTC(purchaseDate.getFullYear(), purchaseDate.getMonth(), purchaseDate.getDate()));
+
+    const diffDays = Math.floor((minskTodayMidnight - purchaseDateMidnight) / (1000 * 60 * 60 * 24));
     if (diffDays < 0) {
       sendMessage(chatId, '❗ Некорректная дата (дата из будущего)\nПожалуйста, введите реальную дату покупки в формате *DD.MM.YYYY*');
       return;
@@ -293,10 +304,10 @@ function normalizeSerial(str) { return str.replace(/\s+/g, '').toUpperCase(); }
 function formatPrice(price) {
   const num = parseFloat(price);
   if (isNaN(num)) return "Цена не указана";
-  const rubles = Math.floor(num);
-  const kopecks = Math.round((num - rubles) * 100);
-  const formattedRubles = rubles.toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
-  return `${formattedRubles}.${kopecks.toString().padStart(2, '0')}`;
+  const parts = num.toFixed(2).split('.');
+  const rubles = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+  const kopecks = parts[1];
+  return `${rubles}.${kopecks}`;
 }
 
 // ================= ЛОГИКА ПОИСКА В МАГАЗИНЕ (ОПТИМИЗАЦИЯ ПОД 50К+ СТРОК) =================
