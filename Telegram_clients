@@ -190,6 +190,10 @@ function handleMessage(msg) {
     const purchaseDate = new Date(inputDate);
     const now = new Date();
     const diffDays = Math.floor((now - purchaseDate) / (1000 * 60 * 60 * 24));
+    if (diffDays < 0) {
+      sendMessage(chatId, '❗ Некорректная дата (дата из будущего)\nПожалуйста, введите реальную дату покупки в формате *DD.MM.YYYY*');
+      return;
+    }
     if (diffDays > 14) {
       sendMessage(chatId, '⚠️ *Срок подтверждения гарантии истёк*\n\nПодтверждение возможно в течение *14 дней* после покупки.\n\n📅 Прошло дней: *' + diffDays + '*\n📆 Дата покупки: *' + text + '*\n\nК сожалению, гарантия больше не может быть активирована.');
       clearState(chatId);
@@ -578,4 +582,21 @@ function sendMessage(chatId, text, keyboard = null) {
   } catch (e) {
     console.error(`ERROR sending message: ${e}`);
   }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    handleMessage,
+    processShopSearch,
+    escapeMarkdown,
+    formatPrice,
+    STATE,
+    getState,
+    setState,
+    clearState,
+    sendMessage,
+    processGuarantee,
+    processRepairRequest,
+    cache
+  };
 }

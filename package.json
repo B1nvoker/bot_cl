@@ -1,0 +1,12 @@
+{
+  "name": "telegram_clients_bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "Telegram_clients",
+  "scripts": {
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
